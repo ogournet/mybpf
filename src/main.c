@@ -6,8 +6,11 @@
 #include <getopt.h>
 #include <sys/resource.h>
 #include <net/if.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
 #include <errno.h>
 #include <ev.h>
+#include <net/ethernet.h>
 
 #include <bpf/libbpf.h>
 #include <bpf/btf.h>
@@ -19,6 +22,7 @@
 
 
 enum prg_type {
+	PRG_PASS,
 	PRG_MAP_RESIZE,
 	PRG_CPUMAP,
 	PRG_BPF_VAR,
@@ -181,6 +185,20 @@ signal_cb(struct pq_ctx */* ctx */, void */* uctx */, void *data, uint32_t data_
 /* 'pkt_queue' program */
 
 
+/*
+ * test case: ping on veth1, xdp prog rx on veth2, redirect to AF_XDP,
+ * store in umem, then on timeout tx it on veth2.
+ *
+ * schema:
+ *      veth1       <------>      veth2 (in netns)
+ *
+ * 1.  ping   (TX)   ------>      (RX) xdp prg (bpf_redirect)  --\
+ * 2.     /------<     [umem] <-----       AF_XDP           <----/
+ * 3.  timeout ---> modify packet, reply to icmp er, swap mac --\
+ * 4.     /-- (RX)    <------       (TX)                     <--/
+ * 5.  shown on tcpdump
+ */
+
 static void
 read_pkt_cb(struct pq_ctx */* ctx */, void */* uctx */, struct pq_desc *pkt)
 {
@@ -188,9 +206,28 @@ read_pkt_cb(struct pq_ctx */* ctx */, void */* uctx */, struct pq_desc *pkt)
 }
 
 static void
-timeout_pkt_cb(struct pq_ctx */* ctx */, void */* uctx */, struct pq_desc *pkt)
+timeout_pkt_cb(struct pq_ctx *ctx, void */* uctx */, struct pq_desc *pkt)
 {
+	struct ether_header *eth;
+	struct iphdr *ip;
+	struct icmphdr *icmp;
+	uint8_t buf[ETH_ALEN];
+	uint32_t tmp;
+
 	printf("timeout xdp frame at %p of %d!!!\n", pkt->data, pkt->len);
+	eth = (struct ether_header *)pkt->data;
+	memcpy(buf, eth->ether_dhost, ETH_ALEN);
+	memcpy(eth->ether_dhost, eth->ether_shost, ETH_ALEN);
+	memcpy(eth->ether_shost, buf, ETH_ALEN);
+	ip = (struct iphdr *)(eth + 1);
+	tmp = ip->saddr;
+	ip->saddr = ip->daddr;
+	ip->daddr = tmp;
+	icmp = (struct icmphdr *)(ip + 1);
+	icmp->type = ICMP_ECHOREPLY;
+	icmp->checksum += ICMP_ECHO;
+
+	pq_tx(ctx, 0, pkt);
 }
 
 
@@ -199,9 +236,11 @@ timeout_pkt_cb(struct pq_ctx */* ctx */, void */* uctx */, struct pq_desc *pkt)
 /* main */
 
 static char iface[128] = "lo";
+static char tx_iface[128];
 
 
 static const char *prglist[PRG_MAX] = {
+	[PRG_PASS] = "pass",
 	[PRG_MAP_RESIZE] = "map_resize",
 	[PRG_CPUMAP] = "cpumap",
 	[PRG_BPF_VAR] = "bpf_var",
@@ -212,6 +251,7 @@ static const char *prglist[PRG_MAX] = {
 static const struct option long_options[] = {
 	{ "help", 0, NULL, 'h' },
 	{ "iface", 1, NULL, 'i' },
+	{ "tx-iface", 1, NULL, 'I' },
 	{ NULL, 0, NULL, 0 },
 };
 
@@ -223,7 +263,8 @@ usage(const char *prgname)
 	printf("usage: %s [options] <program>\n", prgname);
 	printf("options are:\n"
 	       "  -h  --help            display this help\n"
-	       "  -i  --iface           use this interface [lo]\n");
+	       "  -i  --iface           use this interface [lo]\n"
+	       "  -I  --tx-iface        interface for xsk tx [iface]\n");
 	printf("program can be:\n");
 	for (i = 0; i < PRG_MAX; i++)
 		printf("  %s\n", prglist[i]);
@@ -251,7 +292,10 @@ int main(int argc, char **argv)
 			usage(argv[0]);
 			break;
 		case 'i':
-			strcpy(iface, argv[2]);
+			strcpy(iface, optarg);
+			break;
+		case 'I':
+			strcpy(tx_iface, optarg);
 			break;
 		}
 	}
@@ -333,11 +377,12 @@ int main(int argc, char **argv)
 			/* test pkt_queue implementation */
 			struct pq_cfg phc = {
 				.xsks_map = "xsks_map",
-				.timeout = 3,
+				.timeout_ms = 2000,
 				.read_pkt_cb = read_pkt_cb,
 				.timeout_pkt_cb = timeout_pkt_cb,
 			};
 			strcpy(phc.rx_iface, iface);
+			strcpy(phc.tx_iface, tx_iface);
 			pq_ctx = pq_ctx_create(&phc, bo);
 		}
 		break;

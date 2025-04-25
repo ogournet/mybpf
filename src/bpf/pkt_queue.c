@@ -30,10 +30,12 @@ int xdp_entry(struct xdp_md *ctx)
 	/* redirect packet on af_xdp socket, of rx queue index */
 	int index = ctx->rx_queue_index;
 	if (bpf_map_lookup_elem(&xsks_map, &index)) {
-		bpf_printk("redirect to xsks index %d", index);
-		return bpf_redirect_map(&xsks_map, index, 0);
+		int action = bpf_redirect_map(&xsks_map, index, 0);
+		bpf_printk("redirect to xsks index %d, ret=%d", index, action);
+		return action;
 	}
 
+	bpf_printk("cannot find xsks entry :/");
 	return XDP_PASS;
 }
 

@@ -50,7 +50,7 @@ struct pq_cfg
 	char tx_iface[128];	// can be unset or the same as rx_iface
 	char xsks_map[32];
 	char signal_map[32];
-	time_t timeout;		// in seconds
+	time_t timeout_ms;
 
 	void (*read_pkt_cb)(struct pq_ctx *ctx, void *uctx, struct pq_desc *pkt);
 	void (*timeout_pkt_cb)(struct pq_ctx *ctx, void *uctx, struct pq_desc *pkt);

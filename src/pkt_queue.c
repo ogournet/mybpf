@@ -111,13 +111,13 @@ complete_tx(struct pq_xsk_socket *xs)
 	ret = sendto(xsk_socket__fd(xs->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
 	if (ret < 0 && (errno != EAGAIN && errno != EBUSY && errno != ENETDOWN))
 		printf("kick_tx sento: %m\n");
-	printf("kick tx ok\n");
 
 	/* reclaim descriptors for finished TX operations, add them to our
 	 * free list */
 	n = min(64, xs->outstanding_tx);
 	n = xsk_ring_cons__peek(&u->cq, n, &idx_cq);
 	if (n > 0) {
+		printf("get %d descs from completion ring\n", n);
 		for (i = 0; i < n; i++)
 			u->desc_free[u->desc_free_n++] =
 				*xsk_ring_cons__comp_addr(&u->cq, idx_cq + i);
@@ -150,8 +150,8 @@ pq_tx(struct pq_ctx *ctx, int queue_idx, const struct pq_desc *pkt)
 	xsk_ring_prod__submit(&xs->tx, 1);
 	++xs->outstanding_tx;
 
-	/* printf("write tx pkt %p (%d) at addr 0x%lx outstanding: %d\n", */
-	/*        pkt->data, pkt->len, tx_desc->addr, xs->outstanding_tx); */
+	printf("write tx pkt %p (%d) at addr 0x%llx outstanding: %d\n",
+	       pkt->data, pkt->len, tx_desc->addr, xs->outstanding_tx);
 
 	complete_tx(xs);
 }
@@ -536,7 +536,7 @@ timeout_cb(struct ev_loop * /* loop */, struct ev_timer *t, int /* revents */)
 
 	for (i = u->desc_pending_b; i < u->desc_pending_e; i++) {
 		pkt = _get_pending_desc(ctx, i);
-		if (pkt->alloc_time + ctx->c.timeout > time(NULL))
+		if (pkt->alloc_time + ctx->c.timeout_ms / 1000 > time(NULL))
 			break;
 		printf("free pkt %p pending: [%d-%d]\n", pkt->data,
 		       u->desc_pending_b, u->desc_pending_e);
@@ -575,7 +575,8 @@ pq_ctx_create(struct pq_cfg *cfg, struct bpf_object *oprg)
 		if (!ret)
 			ret = xsk_get_cur_queues(cfg->tx_iface, &tmp, &ctx->tx_sock_n);
 		if (ret < 0) {
-			printf("cannot get cur_queues: %m\n");
+			printf("cannot get cur_queues on %s/%s: %m\n",
+			       cfg->rx_iface, cfg->tx_iface);
 			free(ctx);
 			return NULL;
 		}
@@ -586,7 +587,7 @@ pq_ctx_create(struct pq_cfg *cfg, struct bpf_object *oprg)
 		/* same interface for RX/TX */
 		ret = xsk_get_cur_queues(cfg->rx_iface, &ctx->rx_sock_n, &ctx->tx_sock_n);
 		if (ret < 0) {
-			printf("cannot get cur_queues: %m\n");
+			printf("cannot get cur_queues on %s: %m\n", cfg->rx_iface);
 			free(ctx);
 			return NULL;
 		}

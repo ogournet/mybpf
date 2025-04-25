@@ -38,3 +38,24 @@ ping 127.0.0.1
 ```
 
 see sources for more details on programs.
+
+
+### pkt_queue test:
+
+setup is:
+
+```
+sudo ip netns add test-bpf
+sudo ip link add dev bpf1 type veth peer name bpf2 netns test-bpf
+sudo ip link set dev bpf1 up
+sudo ip -n test-bpf link set dev bpf2 up
+sudo ip addr add 192.168.62.1/24 dev bpf1
+sudo ip -n test-bpf addr add 192.168.62.2/24 dev bpf2
+
+# in a first terminal
+ip netns exec test-bpf ./build/mybpf -i bpf2 pkt_queue
+
+# in a second terminal
+ping -c 1 192.168.62.2
+# ping should complete with a delay
+```
