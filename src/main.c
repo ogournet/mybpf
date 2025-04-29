@@ -28,6 +28,7 @@ enum prg_type {
 	PRG_BPF_VAR,
 	PRG_SIGNAL,
 	PRG_PKT_QUEUE,
+	PRG_IPFRAG,
 
 	PRG_MAX,
 };
@@ -246,6 +247,7 @@ static const char *prglist[PRG_MAX] = {
 	[PRG_BPF_VAR] = "bpf_var",
 	[PRG_SIGNAL] = "signal",
 	[PRG_PKT_QUEUE] = "pkt_queue",
+	[PRG_IPFRAG] = "ipfrag",
 };
 
 static const struct option long_options[] = {
@@ -387,6 +389,11 @@ int main(int argc, char **argv)
 		}
 		break;
 
+	case PRG_IPFRAG:
+		if (ipfrag_init(iface, bo) < 0)
+			goto err;
+		break;
+
 	default:
 		break;
 	}
@@ -424,6 +431,11 @@ int main(int argc, char **argv)
 	case PRG_SIGNAL:
 	case PRG_PKT_QUEUE:
 		pq_ctx_load(pq_ctx);
+		break;
+
+	case PRG_IPFRAG:
+		if (ipfrag_load(bo) < 0)
+			goto err;
 		break;
 
 	default:

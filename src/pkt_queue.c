@@ -15,18 +15,19 @@
 #include <xdp/xsk.h>
 #include <bpf/btf.h>
 
+#include "lib/hlist.h"
 #include "mybpf-priv.h"
 
 /*
- * paquet queueing using AF_XDP.
+ * packet queueing using AF_XDP.
  *
- * paquets (and optional metadata) are read from xsk, stay on umem,
+ * packets data/metadata are read from xsk, stay on umem,
  * and are freed on timeout or when user TX them on xsk.
  *
  * moreover, there's a signal channel using perf_buffer that can be used
- * to trigger TX on queued paquets.
+ * to trigger TX on queued packets.
  *
- * paquets can be RX/TX on the same iface, or RX from one iface (nic) and
+ * packets can be RX/TX on the same iface, or RX from one iface (nic) and
  * TX to another (veth). last option allow triggering xdp program on TX
  * (RX on the other veth side).
  *    RX: one xsk socket will be created for each rx queue.
@@ -51,7 +52,7 @@ struct pq_ctx
 	struct perf_buffer	*pb;
 	struct perfb_ev		**apev;
 
-	/* single timer to timeout hold paquets */
+	/* single timer to timeout hold packets */
 	struct ev_timer		timer;
 };
 
@@ -117,7 +118,6 @@ complete_tx(struct pq_xsk_socket *xs)
 	n = min(64, xs->outstanding_tx);
 	n = xsk_ring_cons__peek(&u->cq, n, &idx_cq);
 	if (n > 0) {
-		printf("get %d descs from completion ring\n", n);
 		for (i = 0; i < n; i++)
 			u->desc_free[u->desc_free_n++] =
 				*xsk_ring_cons__comp_addr(&u->cq, idx_cq + i);
@@ -150,11 +150,9 @@ pq_tx(struct pq_ctx *ctx, int queue_idx, const struct pq_desc *pkt)
 	xsk_ring_prod__submit(&xs->tx, 1);
 	++xs->outstanding_tx;
 
-	printf("write tx pkt %p (%d) at addr 0x%llx outstanding: %d\n",
-	       pkt->data, pkt->len, tx_desc->addr, xs->outstanding_tx);
-
 	complete_tx(xs);
 }
+
 
 /*
  * read callback
@@ -169,7 +167,6 @@ xsk_cb(struct ev_loop *, struct ev_io *w, int /* revents */)
 	uint32_t idx_rx = 0, idx_fq = 0;
 
 	rcvd = xsk_ring_cons__peek(&xs->rx, 64, &idx_rx);
-	printf("have %d read data at idx %d !!!!\n", rcvd, idx_rx);
 	if (!rcvd)
 		return;
 
@@ -252,7 +249,7 @@ _setup_umem(struct pq_ctx *ctx)
 		    .comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
 		    .frame_size = XSK_UMEM__DEFAULT_FRAME_SIZE,
 		    /* leave space before packet data on rx, if we wanna add encap. */
-		    .frame_headroom = 128,
+		    .frame_headroom = 256,
 		    .flags = 0,
 		    .tx_metadata_len = 0,
 	);
@@ -321,18 +318,18 @@ _setup_socket(struct pq_ctx *ctx, const char *ifname, int queue_id, bool w_rx, b
 	xs->ctx = ctx;
 	xs->umem = u;
 	LIBBPF_OPTS(xsk_socket_opts, xsd_cfg,
+		    .fill = &xs->fq,
+		    .comp = &xs->cq,
 		    .libxdp_flags = XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD,
 		    .xdp_flags = XDP_FLAGS_DRV_MODE,
 		    .bind_flags = XDP_USE_NEED_WAKEUP | XDP_COPY,
 	);
 	if (w_rx) {
 		xsd_cfg.rx = &xs->rx;
-		xsd_cfg.fill = &xs->fq;
 		xsd_cfg.rx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
 	}
 	if (w_tx) {
 		xsd_cfg.tx = &xs->tx;
-		xsd_cfg.comp = &xs->cq;
 		xsd_cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
 	}
 
@@ -604,39 +601,11 @@ pq_ctx_create(struct pq_cfg *cfg, struct bpf_object *oprg)
 			return NULL;
 		}
 	} else if (*cfg->xsks_map) {
-		printf("cannot find table %s, do not load pkthold af_xdp\n",
+		printf("cannot find table %s, do not load pkt_queue af_xdp\n",
 		       cfg->xsks_map);
 	}
 
 	ctx->signal_map = bpf_object__find_map_by_name(oprg, cfg->signal_map);
-
-	/*
-	 * af_xdp metadata. plays with btf.
-	 */
-	struct btf *btf = bpf_object__btf(oprg);
-
-	int id = btf__find_by_name_kind(btf, "xdp_metadata_ipfrag_key", BTF_KIND_STRUCT);
-	if (id < 0) {
-		printf("cannot find xdp_metadata_ipfrag_key\n");
-		return ctx;
-	}
-
-	const struct btf_type *t = btf__type_by_id(btf, id);
-	const struct btf_member *m;
-	unsigned short vlen;
-	int i;
-	m = btf_members(t);
-	vlen = BTF_INFO_VLEN(t->info);
-	for (i = 0; i < vlen; i++, m++) {
-		const char *name = btf__name_by_offset(btf, m->name_off);
-
-		if (strcmp(name, "mark"))
-			continue;
-		uint32_t offset = BTF_MEMBER_BIT_OFFSET(m->offset) / 8;
-		uint32_t size = btf__resolve_size(btf, m->type);
-		printf("found field mark: offset %d, size: %d total size: %d\n",
-		       offset, size, t->size);
-	}
 
 	return ctx;
 }
@@ -669,4 +638,10 @@ pq_ctx_release(struct pq_ctx *ctx)
 		pq_xsk_release(ctx);
 		free(ctx);
 	}
+}
+
+const struct pq_cfg *
+pq_cfg(struct pq_ctx *ctx)
+{
+	return &ctx->c;
 }

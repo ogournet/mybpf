@@ -20,6 +20,7 @@ arch = arch.replace('x86_64', 'x86').replace('aarch64', 'arm64').replace('ppc64l
 bpftool = find_program('bpftool', required: true)
 libbpf_dep = dependency('libbpf')
 libxdp_dep = dependency('libxdp')
+libmnl_dep = dependency('libmnl')
 libev_dep = declare_dependency(link_args: '-lev')
 libbpf_inc = libbpf_dep.get_variable('includedir')
 
@@ -45,6 +46,6 @@ subdir('src/bpf')
 subdir('src')
 
 executable('mybpf', src,
-	   dependencies: [libbpf_dep, libxdp_dep, libev_dep],
+	   dependencies: [libbpf_dep, libxdp_dep, libmnl_dep, libev_dep],
 	   install: true
 )

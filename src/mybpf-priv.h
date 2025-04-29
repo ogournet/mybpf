@@ -11,25 +11,6 @@
 # define max(A, B) ((A) > (B) ? (A) : (B))
 #endif
 
-/*
- * container_of - cast a member of a structure out to the containing structure
- *
- * @ptr:	the pointer to the member.
- * @type:	the type of the container struct this is embedded in.
- * @member:	the name of the member within the struct.
- *
- */
-#ifndef container_of
-# define container_of(ptr, type, member) ({			\
-	const typeof( ((type *)0)->member ) *__mptr = (ptr);	\
-	(type *)( (char *)__mptr - offsetof(type,member) );})
-#endif
-#ifndef const_container_of
-# define const_container_of(ptr, type, member) ({			\
-	const typeof( ((type *)0)->member ) *__mptr = (ptr);	\
-	(const type *)( (char *)__mptr - offsetof(type,member) );})
-#endif
-
 
 struct bpf_object;
 struct gp_xsk_umem;
@@ -66,13 +47,17 @@ extern struct ev_loop *loop;
 /* pkthold.c */
 void pq_tx(struct pq_ctx *ctx, int queue_idx, const struct pq_desc *pkt);
 struct pq_ctx *pq_ctx_create(struct pq_cfg *cfg, struct bpf_object *oprg);
+const struct pq_cfg *pq_cfg(struct pq_ctx *ctx);
 int pq_ctx_load(struct pq_ctx *ctx);
 void pq_ctx_release(struct pq_ctx *ctx);
 
 /* ipfrag.c */
 int ipfrag_init(const char *iface, struct bpf_object *oprg);
-int ipfrag_load(void);
+int ipfrag_load(struct bpf_object *oprg);
 void ipfrag_release(void);
 
 /* ethtool.c */
 int xsk_get_cur_queues(const char *ifname, uint32_t *rx, uint32_t *tx);
+
+/* veth.c */
+int veth_create(const char *name, const char *peer_name);
