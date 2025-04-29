@@ -59,3 +59,19 @@ ip netns exec test-bpf ./build/mybpf -i bpf2 pkt_queue
 ping -c 1 192.168.62.2
 # ping should complete with a delay
 ```
+
+
+### ipfrag test:
+
+setup is:
+
+```
+sudo ./test/ipfrag.sh setup_ipfrag
+sudo ./build/mybpf -i bpf-main pass
+
+# in another terminal
+sudo ip netns exec test-bpf ./build/mybpf -i bpf-prg ipfrag
+
+# in a third terminal
+sudo ./test/ipfrag.sh run_ipfrag
+```
