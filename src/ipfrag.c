@@ -41,7 +41,7 @@ int fragdata_hash(const union ipfrag_key *fkey, uint32_t *out_keylen)
 			% HFRAGLIST_SIZE;
 
 	case AF_INET6:
-		*out_keylen = 44;
+		*out_keylen = 40;
 		return 0;
 	default:
 		return -1;

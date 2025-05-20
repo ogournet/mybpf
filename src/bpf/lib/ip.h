@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
 
 #pragma once
 
@@ -31,7 +32,11 @@ union v4v6addr
 	union v6addr		ip6;
 } __attribute__((packed));
 
-/* ipfrag key. used as metadata */
+
+
+/*********************************/
+/* ipfrag */
+
 union ipfrag_key
 {
 	__u8	family;
@@ -67,6 +72,10 @@ struct ipfrag_rule
 	struct bpf_timer timer;
 	__u8 flags;
 };
+
+/*********************************/
+
+
 
 /* Program statistics */
 enum pkt_stats_type {

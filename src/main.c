@@ -12,12 +12,15 @@
 #include <ev.h>
 #include <net/ethernet.h>
 
+#include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <bpf/btf.h>
 #include <linux/btf.h>
 
 #include "bpf/lib/test_shared.h"
 
+#include "lib/addr.h"
+#include "cgn.h"
 #include "mybpf-priv.h"
 
 
@@ -29,6 +32,7 @@ enum prg_type {
 	PRG_SIGNAL,
 	PRG_PKT_QUEUE,
 	PRG_IPFRAG,
+	PRG_CGN_BLOCK_ALLOC,
 
 	PRG_MAX,
 };
@@ -231,8 +235,6 @@ timeout_pkt_cb(struct pq_ctx *ctx, void */* uctx */, struct pq_desc *pkt)
 	pq_tx(ctx, 0, pkt);
 }
 
-
-
 /*************************************/
 /* main */
 
@@ -248,12 +250,14 @@ static const char *prglist[PRG_MAX] = {
 	[PRG_SIGNAL] = "signal",
 	[PRG_PKT_QUEUE] = "pkt_queue",
 	[PRG_IPFRAG] = "ipfrag",
+	[PRG_CGN_BLOCK_ALLOC] = "cgn_block_alloc",
 };
 
 static const struct option long_options[] = {
 	{ "help", 0, NULL, 'h' },
 	{ "iface", 1, NULL, 'i' },
 	{ "tx-iface", 1, NULL, 'I' },
+	{ "test-id", 1, NULL, 't' },
 	{ NULL, 0, NULL, 0 },
 };
 
@@ -266,7 +270,8 @@ usage(const char *prgname)
 	printf("options are:\n"
 	       "  -h  --help            display this help\n"
 	       "  -i  --iface           use this interface [lo]\n"
-	       "  -I  --tx-iface        interface for xsk tx [iface]\n");
+	       "  -I  --tx-iface        interface for xsk tx [iface]\n"
+	       "  -t  --test-id         start this test-id [1]\n");
 	printf("program can be:\n");
 	for (i = 0; i < PRG_MAX; i++)
 		printf("  %s\n", prglist[i]);
@@ -283,9 +288,10 @@ int main(int argc, char **argv)
 	enum prg_type prgtype;
 	ev_timer poll_timer;
 	int iface_idx, ret = 9;
+	int test_id = 1;
 
 	while (1) {
-		int c = getopt_long(argc, argv, "hi:", long_options, NULL);
+		int c = getopt_long(argc, argv, "hi:t:", long_options, NULL);
 		if (c == -1)
 			break;
 
@@ -298,6 +304,9 @@ int main(int argc, char **argv)
 			break;
 		case 'I':
 			strcpy(tx_iface, optarg);
+			break;
+		case 't':
+			test_id = atoi(optarg);
 			break;
 		}
 	}
@@ -394,6 +403,10 @@ int main(int argc, char **argv)
 			goto err;
 		break;
 
+	case PRG_CGN_BLOCK_ALLOC:
+		cgn_test_init(test_id, bo);
+		break;
+
 	default:
 		break;
 	}
@@ -437,6 +450,11 @@ int main(int argc, char **argv)
 		if (ipfrag_load(bo) < 0)
 			goto err;
 		break;
+
+	case PRG_CGN_BLOCK_ALLOC:
+		cgn_test_start(test_id, bo);
+		ret = 0;
+		goto err;
 
 	default:
 		break;

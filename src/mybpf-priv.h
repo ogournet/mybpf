@@ -11,6 +11,7 @@
 # define max(A, B) ((A) > (B) ? (A) : (B))
 #endif
 
+#define ARRAY_SIZE(A)		(sizeof (A) / sizeof ((A)[0]))
 
 struct bpf_object;
 struct gp_xsk_umem;

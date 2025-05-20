@@ -1,7 +1,7 @@
 
 fs = import('fs')
 
-bpf_sources = files('pass.c', 'map_resize.c', 'cpumap.c', 'signal.c', 'bpf_var.c', 'pkt_queue.c', 'ipfrag.c')
+bpf_sources = files('pass.c', 'map_resize.c', 'cpumap.c', 'signal.c', 'bpf_var.c', 'pkt_queue.c', 'ipfrag.c', 'cgn_block_alloc.c')
 
 
 # ebpf program needs vmlinux.h header file. it may be generated with bpftool.
