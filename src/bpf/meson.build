@@ -1,16 +1,10 @@
 
 fs = import('fs')
 
-bpf_sources = files('pass.c', 'map_resize.c', 'cpumap.c', 'signal.c', 'bpf_var.c', 'pkt_queue.c', 'ipfrag.c', 'cgn_block_alloc.c')
+bpf_sources = files('pass.c', 'map_resize.c', 'cpumap.c', 'signal.c', 'bpf_var.c', 'pkt_queue.c', 'ipfrag.c', 'cgn_test.c')
 
+bpf_libs = files('lib/cgn-def.h', 'lib/cgn.h', 'lib/ip.h')
 
-# ebpf program needs vmlinux.h header file. it may be generated with bpftool.
-vmlinux = custom_target('vmlinux',
-			command: ['bpftool', 'btf', 'dump', 'file',
-				  '/sys/kernel/btf/vmlinux', 'format', 'c' ],
-			output: 'vmlinux.h',
-			capture: true,
-)
 
 # Build BPF codes
 foreach bsrc : bpf_sources
@@ -18,6 +12,7 @@ foreach bsrc : bpf_sources
   bpf_obj = custom_target('bpf-' + name,
 			  input : bsrc,
 			  output : name + '.ll',
+			  build_by_default: true,
 			  command : [clang, '-g', '-O2', '-c', '-emit-llvm',
 				     '-target', 'bpf',
 				     '-D__TARGET_ARCH_' + arch,
@@ -25,7 +20,7 @@ foreach bsrc : bpf_sources
 				     '-I' + libbpf_inc,
 				     clang_includes,
 				     '-o', '@OUTPUT@', '@INPUT@'],
-			  depends : vmlinux
+			  depend_files : bpf_libs
   )
 
   bpf_prog = custom_target('bpf-' + name + '-bin',

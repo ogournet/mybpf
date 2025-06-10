@@ -30,6 +30,7 @@ struct cgn_ctx
 };
 
 
+
 static void
 _set_const_var(struct bpf_object *obj, uint32_t ipbl_n, uint32_t bl_n, uint32_t port_count,
 	       uint32_t bl_flow_max)
@@ -305,45 +306,11 @@ cgn_ctx_dump(const struct cgn_ctx *ctx, int /* full */)
 
 static struct cgn_ctx *test_bctx;
 
-void
-cgn_test_init(int test, struct bpf_object *obj)
-{
-	struct cgn_cfg cfg = {
-		.port_start = 1000,
-		.port_end = 65535,
-		.block_size = 1000,
-		.bflow_size = 2000,
-	};
-
-	switch (test) {
-	case 1:
-		cfg.port_start = 30000;
-		cfg.port_end = 30320;
-		cfg.block_size = 20;
-		cfg.bflow_size = 20;
-		addr_parse_ip("37.127.0.1/32", &cfg.addr[0].a,
-			      &cfg.addr[0].netmask, NULL, 1);
-		break;
-
-	case 2:
-		addr_parse_ip("37.139.0.0/18", &cfg.addr[0].a,
-			      &cfg.addr[0].netmask, NULL, 1);
-		break;
-
-	case 3:
-		addr_parse_ip("37.141.0.0/24", &cfg.addr[0].a,
-			      &cfg.addr[0].netmask, NULL, 1);
-		break;
-	}
-
-	test_bctx = cgn_ctx_create(&cfg, obj);
-	assert(test_bctx != NULL);
-}
 
 static void
 _test1(int fd, struct bpf_test_run_opts *rcfg)
 {
-	struct cgn_parsed_packet *pp = (struct cgn_parsed_packet *)rcfg->data_in;
+	struct cgn_packet *pp = (struct cgn_packet *)rcfg->data_in;
 	int i, k;
 
 	/* 4 users */
@@ -351,11 +318,15 @@ _test1(int fd, struct bpf_test_run_opts *rcfg)
 		/* alloc 4 * 20 = 80 ports */
 		for (i = 0; i < 80; i++) {
 			pp->src_port++;
+			printf("alloc at user[%d]=0x%x port[%d]=%d\n",
+			       k, pp->src_addr, i, pp->src_port);
 			assert(!bpf_prog_test_run_opts(fd, rcfg));
-			if (rcfg->retval)
+			if (rcfg->retval) {
 				printf("ret %d at user=%d port=%d\n",
 				       rcfg->retval, k, i);
-			assert(rcfg->retval == 0);
+				abort();
+			}
+			printf("allocated port = %d\n", pp->src_port);
 		}
 
 		/* cannot alloc more flow */
@@ -363,7 +334,7 @@ _test1(int fd, struct bpf_test_run_opts *rcfg)
 		assert(!bpf_prog_test_run_opts(fd, rcfg));
 		assert(rcfg->retval == 3);
 
-		pp->src_addr++;
+		pp->src_addr = htonl(ntohl(pp->src_addr) + 1);
 		pp->src_port = 32000;
 	}
 
@@ -375,7 +346,7 @@ _test1(int fd, struct bpf_test_run_opts *rcfg)
 static void
 _test2(int fd, struct bpf_test_run_opts *rcfg)
 {
-	struct cgn_parsed_packet *pp = (struct cgn_parsed_packet *)rcfg->data_in;
+	struct cgn_packet *pp = (struct cgn_packet *)rcfg->data_in;
 	int i, k;
 
 	/* alloc for 100k users */
@@ -407,7 +378,7 @@ static void *
 _test3(void *varg)
 {
 	struct test3_arg *arg = varg;
-	struct cgn_parsed_packet pp;
+	struct cgn_packet pp;
 	struct xdp_md ctx_in = {
 		.data_end = sizeof (pp),
 	};
@@ -443,7 +414,7 @@ _test3(void *varg)
 			}
 		}
 
-		pp.src_addr++;
+		pp.src_addr = htonl(ntohl(pp.src_addr) + 1);
 		pp.src_port = 10000 + arg->id * 1000;
 	}
 
@@ -454,38 +425,92 @@ _test3(void *varg)
 
 
 void
+cgn_test_init(int test, struct bpf_object *obj)
+{
+	struct cgn_cfg cfg = {
+		.port_start = 1000,
+		.port_end = 65535,
+		.block_size = 1000,
+		.bflow_size = 2000,
+	};
+
+	switch (test) {
+	case 1:
+		cfg.port_start = 30000;
+		cfg.port_end = 30320;
+		cfg.block_size = 20;
+		cfg.bflow_size = 20;
+		addr_parse_ip("37.127.0.1/32", &cfg.addr[0].a,
+			      &cfg.addr[0].netmask, NULL, 1);
+		break;
+
+	case 2:
+		addr_parse_ip("37.139.0.0/18", &cfg.addr[0].a,
+			      &cfg.addr[0].netmask, NULL, 1);
+		break;
+
+	case 3:
+	case 10:
+		addr_parse_ip("37.141.0.0/24", &cfg.addr[0].a,
+			      &cfg.addr[0].netmask, NULL, 1);
+		break;
+	}
+
+	test_bctx = cgn_ctx_create(&cfg, obj);
+	assert(test_bctx != NULL);
+}
+
+int
 cgn_test_start(int test, struct bpf_object *obj)
 {
+	const char *prgname;
 	const int cpu_n = libbpf_num_possible_cpus();
 	struct bpf_program *prg;
-	struct cgn_parsed_packet pp;
+	uint8_t data_in[2000], data_out[2000];
+	struct cgn_packet *pp = (struct cgn_packet *)data_in;
 	struct xdp_md ctx_in = {
-		.data_end = sizeof (pp),
+		.data_end = sizeof (*pp),
 	};
 	int prg_fd;
 	pthread_t pth[cpu_n];
 	int i;
 
 	if (cgn_ctx_load(test_bctx) < 0)
-		return;
+		return -1;
 
-	prg = bpf_object__find_program_by_name(obj, "xdp_test_alloc");
+	switch (test) {
+	case 1 ... 3:
+		prgname = "xdp_test_alloc";
+		break;
+	case 10:
+		prgname = "xdp_entry";
+		break;
+	default:
+		printf("test %d not implemented\n", test);
+		return -1;
+	}
+
+	prg = bpf_object__find_program_by_name(obj, prgname);
 	if (prg == NULL) {
-		printf("cannot find function 'xdp_test_alloc'\n");
-		return;
+		printf("cannot find function '%s'\n", prgname);
+		return -1;
 	}
 	prg_fd = bpf_program__fd(prg);
 
-	pp.src_addr = 0x0a000001;
-	pp.dst_addr = 0x08080808;
-	pp.src_port = 13555;
-	pp.dst_port = 80;
-	pp.from_priv = 1;
-	pp.proto = IPPROTO_TCP;
+	pp->src_addr = 0x0100000a;
+	pp->dst_addr = 0x08080808;
+	pp->src_port = 13555;
+	pp->dst_port = 80;
+	pp->from_priv = 1;
+	pp->proto = IPPROTO_TCP;
+	pp->data_end = NULL;
+	pp->icmp_err = NULL;
 
 	LIBBPF_OPTS(bpf_test_run_opts, rcfg,
-		    .data_in = &pp,
-		    .data_size_in = sizeof (pp),
+		    .data_in = data_in,
+		    .data_out = data_out,
+		    .data_size_in = sizeof (*pp),
+		    .data_size_out = sizeof (data_out),
 		    .ctx_in = &ctx_in,
 		    .ctx_size_in = sizeof (ctx_in),
 		    .repeat = 1);
@@ -516,5 +541,12 @@ cgn_test_start(int test, struct bpf_object *obj)
 
 		for (i = 0; i < cpu_n; i++)
 			pthread_join(pth[i], NULL);
+		break;
+
+	case 10:
+		/* nothing here, run the main loop */
+		return 1;
 	}
+
+	return 0;
 }

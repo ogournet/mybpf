@@ -14,7 +14,7 @@ struct cgn_v4_block {
 	__u32			ipbl_idx;	/* idx in map 'blocks' */
 	__u16			bl_idx;		/* ipbl->b[@idx] */
 	__u16			cgn_port_start;	/* fixed */
-} __attribute__((packed));
+};
 
 struct cgn_v4_ipblock {
 	__u32			ipbl_idx;
@@ -24,7 +24,7 @@ struct cgn_v4_ipblock {
 	__u32			total;
 	__u32			next;
 	struct cgn_v4_block	b[];		/* 'total' blocks follow */
-} __attribute__((packed));
+};
 
 
 /* global lock for ipv4 block allocation */
@@ -115,12 +115,15 @@ struct cgn_user {
 
 
 /* all address/port in cpu order */
-struct cgn_parsed_packet
+struct cgn_packet
 {
-	__u32	src_addr;
-	__u32	dst_addr;
-	__u16	src_port;
-	__u16	dst_port;
-	__u8	from_priv;
-	__u8	proto;
-} __attribute__((packed));
+	__u32		src_addr;
+	__u32		dst_addr;
+	__u16		src_port;
+	__u16		dst_port;
+	__u8		proto;
+	__u8		from_priv;
+	__u8		_pad[2];
+	void		*data_end;
+	struct icmphdr	*icmp_err;
+};

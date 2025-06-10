@@ -26,4 +26,4 @@ struct cgn_ctx *cgn_ctx_create(const struct cgn_cfg *bc, struct bpf_object *oprg
 int cgn_ctx_load(const struct cgn_ctx *ctx);
 void cgn_ctx_dump(const struct cgn_ctx *ctx, int full);
 void cgn_test_init(int test, struct bpf_object *obj);
-void cgn_test_start(int test, struct bpf_object *obj);
+int cgn_test_start(int test, struct bpf_object *obj);

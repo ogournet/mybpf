@@ -5,7 +5,13 @@
 #include <time.h>
 #include <linux/bpf.h>
 #include <linux/errno.h>
+#include <linux/in.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
+#include <linux/tcp.h>
+#include <linux/icmp.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
 
 #include "cgn-def.h"
 
@@ -28,7 +34,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, struct cgn_user_key);
 	__type(value, struct cgn_user);
-	__uint(max_entries, 150000);
+	__uint(max_entries, 120000);
 } users SEC(".maps");
 
 
@@ -58,6 +64,8 @@ _user_v4_alloc(__u32 addr)
 
 	ret = bpf_map_update_elem(&users, &uk, &u, BPF_NOEXIST);
 	if (ret < 0) {
+		if (ret == -EEXIST)
+			return _user_v4_lookup(addr);
 		bpf_printk("cannot allocate user: %d", ret);
 		return NULL;
 	}
@@ -73,6 +81,7 @@ _user_v4_release(struct cgn_user *u)
 		.flags = 0,
 	};
 
+	/* bpf_printk("release user %x", u->addr.ip4); */
 	bpf_map_delete_elem(&users, &uk);
 }
 
@@ -398,6 +407,7 @@ static int
 _flow_timer_cb(void *_map, struct cgn_v4_flow_priv_key *key,
 	       struct cgn_v4_flow_priv *f)
 {
+	/* bpf_printk("flow_timer_cb"); */
 	_flow_release(key, f);
 	return 0;
 }
@@ -415,7 +425,7 @@ _block_get_next_port(struct cgn_v4_block *bl)
 }
 
 static inline struct cgn_v4_flow_priv *
-_flow_alloc(struct cgn_user *u, const struct cgn_parsed_packet *pp)
+_flow_alloc(struct cgn_user *u, const struct cgn_packet *pp)
 {
 	struct cgn_v4_ipblock *ipbl;
 	struct cgn_v4_block *bl;
@@ -459,8 +469,9 @@ _flow_alloc(struct cgn_user *u, const struct cgn_parsed_packet *pp)
 		if (!cgn_port)
 			return NULL;
 	}
-	/* bpf_printk("%d: user %d get port: %d newrefc: %d ", */
-	/* 	   bpf_get_smp_processor_id(), u->addr.ip4, cgn_port, bl->refcnt); */
+	/* bpf_printk("%d: user 0x%x get port: %d newrefc: %d ", */
+	/* 	   bpf_get_smp_processor_id(), bpf_ntohl(u->addr.ip4), */
+	/* 	   cgn_port, bl->refcnt); */
 
 	/* add pub entry */
 	struct cgn_v4_flow_pub_key pub_k = {
@@ -517,7 +528,7 @@ _flow_alloc(struct cgn_user *u, const struct cgn_parsed_packet *pp)
 	ret = bpf_timer_set_callback(&f->timer, _flow_timer_cb);
 	if (ret)
 		goto err;
-	ret = bpf_timer_start(&f->timer, 1 * 1000 * 1000 * 1000, 0);
+	ret = bpf_timer_start(&f->timer, 20ULL * 1000 * 1000 * 1000, 0);
 	if (ret)
 		goto err;
 
@@ -532,7 +543,7 @@ _flow_alloc(struct cgn_user *u, const struct cgn_parsed_packet *pp)
 
 
 static struct cgn_v4_flow_pub *
-_flow_v4_lookup_pub(const struct cgn_parsed_packet *pp)
+_flow_v4_lookup_pub(const struct cgn_packet *pp)
 {
 	struct cgn_v4_flow_pub_key pub_k = {
 		.cgn_addr = pp->dst_addr,
@@ -546,7 +557,7 @@ _flow_v4_lookup_pub(const struct cgn_parsed_packet *pp)
 }
 
 static struct cgn_v4_flow_priv *
-_flow_v4_lookup_priv(const struct cgn_parsed_packet *pp)
+_flow_v4_lookup_priv(const struct cgn_packet *pp)
 {
 	struct cgn_v4_flow_priv_key priv_k = {
 		.priv_addr = pp->src_addr,
@@ -559,3 +570,381 @@ _flow_v4_lookup_priv(const struct cgn_parsed_packet *pp)
 	return bpf_map_lookup_elem(&v4_priv_flows, &priv_k);
 }
 
+
+
+/*
+ * packet from private: may create user/flow,
+ * and update src addr/port.
+ *
+ * return:
+ *    0: ok
+ *   10: no associated flow
+ *   11: user alloc error
+ *   12: flow alloc error
+ */
+static inline __attribute__((always_inline)) int
+cgn_flow_handle_priv(struct cgn_packet *cp)
+{
+	struct cgn_user *u;
+	struct cgn_v4_flow_priv *f;
+
+	u = _user_v4_lookup(cp->src_addr);
+	if (u == NULL) {
+		if (cp->icmp_err != NULL)
+			return 10;
+		u = _user_v4_alloc(cp->src_addr);
+		if (u == NULL)
+			return 11;
+	}
+
+	f = _flow_v4_lookup_priv(cp);
+	if (f == NULL) {
+		if (cp->icmp_err != NULL)
+			return 10;
+		f = _flow_alloc(u, cp);
+		if (f == NULL)
+			return 12;
+	}
+	/* XXX may apply policy or sorts of things on user */
+
+	cp->src_addr = f->cgn_addr;
+	cp->src_port = f->cgn_port;
+
+	return 0;
+}
+
+/*
+ * packet from public: check if a flow exists;
+ *  if there is, update dst addr/port,
+ *  if not, drop packet.
+ *
+ * return:
+ *     0: ok
+ *    10: no associated flow
+ */
+static inline __attribute__((always_inline)) int
+cgn_flow_handle_pub(struct cgn_packet *cp)
+{
+	struct cgn_user *u;
+	struct cgn_v4_flow_pub *f;
+
+	f = _flow_v4_lookup_pub(cp);
+	if (f == NULL)
+		return 10;
+
+	u = _user_v4_lookup(f->priv_addr);
+	if (f == NULL) {
+		/* is a bug */
+		return 10;
+	}
+	/* XXX may apply policy or sorts of things on user */
+
+	cp->dst_addr = f->priv_addr;
+	cp->dst_port = f->priv_port;
+
+	return 0;
+}
+
+
+
+/*
+ * ipv4 packet manipulation
+ */
+
+
+static int
+cgn_pkt_rewrite_src(struct cgn_packet *cp, struct iphdr *ip4h, struct udphdr *udp,
+		    __u32 addr, __u16 port)
+{
+	struct tcphdr *tcp;
+	struct icmphdr *icmp;
+	__u32 sum;
+
+	addr = bpf_htonl(addr);
+	port = bpf_htons(port);
+
+	/* update l4 checksum */
+	switch (cp->proto) {
+	case IPPROTO_UDP:
+		if (udp->check) {
+			sum = csum_diff32(0, ip4h->saddr, addr);
+			sum = csum_diff16(sum, udp->source, port);
+			__u16 nsum = csum_replace(udp->check, sum);
+			if (nsum == 0)
+				nsum = 0xffff;
+			udp->check = nsum;
+		}
+		udp->source = port;
+		break;
+
+	case IPPROTO_TCP:
+		tcp = (struct tcphdr *)udp;
+		if ((void *)(tcp + 1) > cp->data_end)
+			return 1;
+		sum = csum_diff32(0, ip4h->saddr, addr);
+		sum = csum_diff16(sum, tcp->source, port);
+		tcp->check = csum_replace(tcp->check, sum);
+		tcp->source = port;
+		break;
+
+	case IPPROTO_ICMP:
+		icmp = (struct icmphdr *)udp;
+		sum = csum_diff16(0, icmp->un.echo.id, port);
+		icmp->checksum = csum_replace(icmp->checksum, sum);
+		icmp->un.echo.id = port;
+		break;
+	}
+
+	/* decrement ttl and update l3 checksum */
+	sum = csum_diff32(0, ip4h->saddr, addr);
+	ip4h->saddr = addr;
+	if (cp->icmp_err == NULL) {
+		--sum;
+		--ip4h->ttl;
+		ip4h->check = csum_replace(ip4h->check, sum);
+	} else {
+		__u16 old_ip4h_csum = ip4h->check;
+		ip4h->check = csum_replace(ip4h->check, sum);
+		if (cp->proto != IPPROTO_ICMP) {
+			sum = csum_diff16(0, old_ip4h_csum, ip4h->check);
+			cp->icmp_err->checksum = csum_replace(cp->icmp_err->checksum, sum);
+		}
+	}
+
+	return 0;
+}
+
+
+static int
+cgn_pkt_rewrite_dst(struct cgn_packet *cp, struct iphdr *ip4h, struct udphdr *udp,
+		    __u32 addr, __u16 port)
+{
+	struct tcphdr *tcp;
+	struct icmphdr *icmp;
+	__u32 sum;
+
+	addr = bpf_htonl(addr);
+	port = bpf_htons(port);
+
+	/* update l4 checksum */
+	switch (cp->proto) {
+	case IPPROTO_UDP:
+		if (udp->check) {
+			sum = csum_diff32(0, ip4h->daddr, addr);
+			sum = csum_diff16(sum, udp->dest, port);
+			__u16 nsum = csum_replace(udp->check, sum);
+			if (nsum == 0)
+				nsum = 0xffff;
+			udp->check = nsum;
+		}
+		udp->dest = port;
+		break;
+
+	case IPPROTO_TCP:
+		tcp = (struct tcphdr *)udp;
+		if ((void *)(tcp + 1) > cp->data_end)
+			return 1;
+		sum = csum_diff32(0, ip4h->daddr, addr);
+		sum = csum_diff16(sum, tcp->dest, port);
+		tcp->check = csum_replace(tcp->check, sum);
+		tcp->dest = port;
+		break;
+
+	case IPPROTO_ICMP:
+		icmp = (struct icmphdr *)udp;
+		sum = csum_diff16(0, icmp->un.echo.id, port);
+		icmp->checksum = csum_replace(icmp->checksum, sum);
+		icmp->un.echo.id = port;
+		break;
+	}
+
+	/* decrement ttl and update l3 checksum */
+	sum = csum_diff32(0, ip4h->daddr, addr);
+	ip4h->daddr = addr;
+	if (cp->icmp_err == NULL) {
+		--sum;
+		--ip4h->ttl;
+		ip4h->check = csum_replace(ip4h->check, sum);
+	} else {
+		__u16 old_ip4h_csum = ip4h->check;
+		ip4h->check = csum_replace(ip4h->check, sum);
+		if (cp->proto != IPPROTO_ICMP) {
+			sum = csum_diff16(0, old_ip4h_csum, ip4h->check);
+			cp->icmp_err->checksum = csum_replace(cp->icmp_err->checksum, sum);
+		}
+	}
+
+	return 0;
+}
+
+
+/*
+ * process icmp error's inner ip header
+ */
+static inline int
+_handle_pkt_icmp_error(struct xdp_md *ctx, struct iphdr *outer_ip4h,
+		       struct icmphdr *outer_icmp, struct iphdr *ip4h,
+		       __u8 from_priv)
+{
+	void *data_end = (void *)(long)ctx->data_end;
+	struct udphdr *udp;
+	struct icmphdr *icmp;
+	__u32 sum, addr;
+	int ret;
+
+	if ((void *)(ip4h + 1) > data_end || ip4h->version != 4)
+		return 1;
+
+	/* parse packet with swapped src/dst, in order to be able
+	 * to lookup flow */
+	struct cgn_packet cp = {
+		.data_end = data_end,
+		.icmp_err = outer_icmp,
+		.proto = ip4h->protocol,
+		.src_addr = bpf_ntohl(ip4h->daddr),
+		.dst_addr = bpf_ntohl(ip4h->saddr),
+	};
+
+	udp = (void *)(ip4h) + ip4h->ihl * 4;
+	if ((void *)(udp + 1) > data_end)
+		return 1;
+
+	switch (ip4h->protocol) {
+	case IPPROTO_UDP:
+	case IPPROTO_TCP:
+		cp.dst_port = bpf_ntohs(udp->source);
+		cp.src_port = bpf_ntohs(udp->dest);
+		break;
+	case IPPROTO_ICMP:
+		icmp = (struct icmphdr *)udp;
+		switch (icmp->type) {
+		case ICMP_ECHO:
+			cp.dst_port = bpf_ntohs(icmp->un.echo.id);
+			cp.src_port = 0;
+			break;
+		case ICMP_ECHOREPLY:
+			cp.dst_port = 0;
+			cp.src_port = bpf_ntohs(icmp->un.echo.id);
+			break;
+		default:
+			return 2;
+		}
+		break;
+	default:
+		return 2;
+	}
+
+	/* lookup and process flow, then rewrite inner l3/l4 and outer l3 */
+	if (from_priv) {
+		ret = cgn_flow_handle_priv(&cp);
+		if (ret)
+			return ret;
+		ret = cgn_pkt_rewrite_dst(&cp, ip4h, udp, cp.src_addr, cp.src_port);
+		if (ret)
+			return ret;
+
+		addr = bpf_htonl(cp.src_addr);
+		sum = csum_diff32(0, outer_ip4h->saddr, addr);
+		outer_ip4h->saddr = addr;
+
+	} else {
+		ret = cgn_flow_handle_pub(&cp);
+		if (ret)
+			return ret;
+		ret = cgn_pkt_rewrite_src(&cp, ip4h, udp, cp.dst_addr, cp.dst_port);
+		if (ret)
+			return ret;
+
+		addr = bpf_htonl(cp.dst_addr);
+		sum = csum_diff32(0, outer_ip4h->daddr, addr);
+		outer_ip4h->daddr = addr;
+	}
+
+	--sum;
+	--outer_ip4h->ttl;
+	outer_ip4h->check = csum_replace(outer_ip4h->check, sum);
+
+	return 0;
+}
+
+/*
+ * main cgn entry function.
+ * parameters:
+ *  - ip4h: must already be checked (ihl, version, ttl > 0), and cannot be a fragment
+ *  - from_priv: 1 if packet is coming from 'private' side, else 0
+ *
+ * returns:
+ *    0: ok. packet modified
+ *    1: invalid packet
+ *    2: unsupported protocol/operation
+ *   10: no associated flow
+ *   11: user alloc error
+ *   12: flow alloc error
+ */
+static int
+cgn_pkt_handle(struct xdp_md *ctx, struct iphdr *ip4h, __u8 from_priv)
+{
+	void *data_end = (void *)(long)ctx->data_end;
+	struct udphdr *udp;
+	struct icmphdr *icmp;
+	int ret;
+
+	struct cgn_packet cp = {
+		.data_end = data_end,
+		.proto = ip4h->protocol,
+		.from_priv = from_priv,
+		.src_addr = bpf_ntohl(ip4h->saddr),
+		.dst_addr = bpf_ntohl(ip4h->daddr),
+	};
+
+	udp = (void *)(ip4h) + ip4h->ihl * 4;
+	if ((void *)(udp + 1) > data_end)
+		return 1;
+
+	/* bpf_printk("priv:%d parse proto: %d dst: %x ihl %d/%d", from_priv, */
+	/* 	   cp.proto, ip4h->daddr, ip4h->ihl, ip4h->version); */
+
+	switch (cp.proto) {
+	case IPPROTO_UDP:
+	case IPPROTO_TCP:
+		cp.src_port = bpf_ntohs(udp->source);
+		cp.dst_port = bpf_ntohs(udp->dest);
+		break;
+	case IPPROTO_ICMP:
+		icmp = (struct icmphdr *)udp;
+		switch (icmp->type) {
+		case ICMP_ECHO:
+			cp.src_port = bpf_ntohs(icmp->un.echo.id);
+			cp.dst_port = 0;
+			break;
+		case ICMP_ECHOREPLY:
+			cp.src_port = 0;
+			cp.dst_port = bpf_ntohs(icmp->un.echo.id);
+			break;
+		case ICMP_DEST_UNREACH:
+		case ICMP_TIME_EXCEEDED:
+			return _handle_pkt_icmp_error(ctx, ip4h, icmp,
+						      (struct iphdr *)(icmp + 1),
+						      from_priv);
+		default:
+			return 2;
+		}
+		break;
+	default:
+		return 2;
+	}
+
+	if (from_priv) {
+		ret = cgn_flow_handle_priv(&cp);
+		if (ret)
+			return ret;
+		ret = cgn_pkt_rewrite_src(&cp, ip4h, udp, cp.src_addr, cp.src_port);
+	} else {
+		ret = cgn_flow_handle_pub(&cp);
+		if (ret)
+			return ret;
+		ret = cgn_pkt_rewrite_dst(&cp, ip4h, udp, cp.dst_addr, cp.dst_port);
+	}
+
+	return ret;
+}

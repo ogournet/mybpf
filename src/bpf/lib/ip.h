@@ -35,6 +35,35 @@ union v4v6addr
 
 
 /*********************************/
+/* checksum helpers */
+
+static inline __u32 csum_add(__u32 csum, __u32 addend)
+{
+	csum += addend;
+	return csum + (csum < addend);
+}
+
+static inline __u32 csum_diff32(__u32 csum, __u32 from, __u32 to)
+{
+	return csum_add(csum, csum_add(~from, to));
+}
+
+static inline __u32 csum_diff16(__u32 csum, __u16 from, __u16 to)
+{
+	return csum + (~from & 0xffff) + to;
+}
+
+static inline __u16 csum_replace(__u16 old_csum, __u32 diff)
+{
+	__u32 csum = csum_add(diff, ~old_csum & 0xffff);
+	csum = (csum & 0xffff) + (csum >> 16);
+	csum = (csum & 0xffff) + (csum >> 16);
+	return (__u16)~csum;
+}
+
+
+
+/*********************************/
 /* ipfrag */
 
 union ipfrag_key

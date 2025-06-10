@@ -1,9 +1,12 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <fcntl.h>
+#include <sched.h>
 #include <sys/resource.h>
 #include <net/if.h>
 #include <netinet/ip.h>
@@ -32,7 +35,7 @@ enum prg_type {
 	PRG_SIGNAL,
 	PRG_PKT_QUEUE,
 	PRG_IPFRAG,
-	PRG_CGN_BLOCK_ALLOC,
+	PRG_CGN_TEST,
 
 	PRG_MAX,
 };
@@ -41,10 +44,38 @@ enum prg_type {
 struct ev_loop *loop;
 
 /* locals */
+static int debug;
 static struct ev_signal ev_sigint;
 static int sigint;
 static struct bpf_object *bo;
 static struct pq_ctx *pq_ctx;
+
+/*
+ * change current network namespace for this process.
+ * assume iproute2 did create namespaces, with file in /run/netns
+ */
+static void
+change_network_ns(const char *nsname)
+{
+	char nspath[64];
+	int fd;
+
+	snprintf(nspath, sizeof(nspath), "/run/netns/%s", nsname);
+
+	if (unshare(CLONE_NEWNET) < 0) {
+		perror("unshare");
+		return;
+	}
+
+	fd = open(nspath, O_RDONLY, 0);
+	if (fd < 0) {
+		printf("nspath: %m\n");
+	} else {
+		if (setns(fd, CLONE_NEWNET) < 0)
+			printf("setns{%s}: %m", nspath);
+	}
+	close(fd);
+}
 
 
 static void
@@ -63,9 +94,11 @@ sigint_hdl(struct ev_loop *, struct ev_signal *, int)
 
 
 static int
-libbpf_print_fn(enum libbpf_print_level /* level */, const char *format, va_list args)
+libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
-	return vfprintf(stderr, format, args);
+	if (debug || level != LIBBPF_DEBUG)
+		return vfprintf(stderr, format, args);
+	return 0;
 }
 
 
@@ -238,8 +271,7 @@ timeout_pkt_cb(struct pq_ctx *ctx, void */* uctx */, struct pq_desc *pkt)
 /*************************************/
 /* main */
 
-static char iface[128] = "lo";
-static char tx_iface[128];
+static char iface[4][128] = { "lo", "", "", "" };
 
 
 static const char *prglist[PRG_MAX] = {
@@ -250,13 +282,13 @@ static const char *prglist[PRG_MAX] = {
 	[PRG_SIGNAL] = "signal",
 	[PRG_PKT_QUEUE] = "pkt_queue",
 	[PRG_IPFRAG] = "ipfrag",
-	[PRG_CGN_BLOCK_ALLOC] = "cgn_block_alloc",
+	[PRG_CGN_TEST] = "cgn_test",
 };
 
 static const struct option long_options[] = {
 	{ "help", 0, NULL, 'h' },
+	{ "debug", 0, NULL, 'd' },
 	{ "iface", 1, NULL, 'i' },
-	{ "tx-iface", 1, NULL, 'I' },
 	{ "test-id", 1, NULL, 't' },
 	{ NULL, 0, NULL, 0 },
 };
@@ -269,8 +301,8 @@ usage(const char *prgname)
 	printf("usage: %s [options] <program>\n", prgname);
 	printf("options are:\n"
 	       "  -h  --help            display this help\n"
-	       "  -i  --iface           use this interface [lo]\n"
-	       "  -I  --tx-iface        interface for xsk tx [iface]\n"
+	       "  -i  --iface           use this/these interface(s) [lo]\n"
+	       "  -d  --debug           print more information\n"
 	       "  -t  --test-id         start this test-id [1]\n");
 	printf("program can be:\n");
 	for (i = 0; i < PRG_MAX; i++)
@@ -287,11 +319,12 @@ int main(int argc, char **argv)
 	struct bpf_map *map;
 	enum prg_type prgtype;
 	ev_timer poll_timer;
-	int iface_idx, ret = 9;
+	int ret = 9;
 	int test_id = 1;
+	unsigned iface_idx = 0, i;
 
 	while (1) {
-		int c = getopt_long(argc, argv, "hi:t:", long_options, NULL);
+		int c = getopt_long(argc, argv, "hdi:t:", long_options, NULL);
 		if (c == -1)
 			break;
 
@@ -299,11 +332,12 @@ int main(int argc, char **argv)
 		case 'h':
 			usage(argv[0]);
 			break;
-		case 'i':
-			strcpy(iface, optarg);
+		case 'd':
+			debug = 1;
 			break;
-		case 'I':
-			strcpy(tx_iface, optarg);
+		case 'i':
+			if (iface_idx < ARRAY_SIZE(iface))
+				strcpy(iface[iface_idx++], optarg);
 			break;
 		case 't':
 			test_id = atoi(optarg);
@@ -378,7 +412,7 @@ int main(int argc, char **argv)
 				.signal_map = "events",
 				.signal_cb = signal_cb,
 			};
-			strcpy(phc.rx_iface, iface);
+			strcpy(phc.rx_iface, iface[0]);
 			pq_ctx = pq_ctx_create(&phc, bo);
 		}
 		break;
@@ -392,18 +426,19 @@ int main(int argc, char **argv)
 				.read_pkt_cb = read_pkt_cb,
 				.timeout_pkt_cb = timeout_pkt_cb,
 			};
-			strcpy(phc.rx_iface, iface);
-			strcpy(phc.tx_iface, tx_iface);
+			strcpy(phc.rx_iface, iface[0]);
+			strcpy(phc.tx_iface, iface[1]);
+			*iface[1] = 0;  /* do not run bpf prog on it */
 			pq_ctx = pq_ctx_create(&phc, bo);
 		}
 		break;
 
 	case PRG_IPFRAG:
-		if (ipfrag_init(iface, bo) < 0)
+		if (ipfrag_init(iface[0], bo) < 0)
 			goto err;
 		break;
 
-	case PRG_CGN_BLOCK_ALLOC:
+	case PRG_CGN_TEST:
 		cgn_test_init(test_id, bo);
 		break;
 
@@ -451,10 +486,10 @@ int main(int argc, char **argv)
 			goto err;
 		break;
 
-	case PRG_CGN_BLOCK_ALLOC:
-		cgn_test_start(test_id, bo);
-		ret = 0;
-		goto err;
+	case PRG_CGN_TEST:
+		if ((ret = cgn_test_start(test_id, bo)) <= 0)
+			goto err;
+		break;
 
 	default:
 		break;
@@ -466,11 +501,25 @@ int main(int argc, char **argv)
 		printf("cannot find function 'xdp_entry'\n");
 		goto err;
 	}
-	iface_idx = if_nametoindex(iface);
-	link = bpf_program__attach_xdp(prg, iface_idx);
-	if (link == NULL) {
-		printf("failed to attach program\n");
-		goto err;
+	for (i = 0; i < ARRAY_SIZE(iface) && *iface[i]; i++) {
+		char ifn[128], *ns;
+
+		strcpy(ifn, iface[i]);
+		if ((ns = strchr(ifn, '@')) != NULL) {
+			*ns++ = 0;
+			change_network_ns(ns);
+		}
+
+		iface_idx = if_nametoindex(ifn);
+		if (!iface_idx) {
+			printf("iface '%s' in netns %s: %m\n", ifn, ns);
+			goto err;
+		}
+		link = bpf_program__attach_xdp(prg, iface_idx);
+		if (link == NULL) {
+			printf("failed to attach program\n");
+			goto err;
+		}
 	}
 
 	if (isatty(STDIN_FILENO)) {

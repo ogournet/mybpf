@@ -75,3 +75,8 @@ sudo ip netns exec test-bpf ./build/mybpf -i bpf-prg ipfrag
 # in a third terminal
 sudo ./test/ipfrag.sh run_ipfrag
 ```
+
+
+### cgn test:
+
+see `test/cgn_setup.sh` for instructions.
