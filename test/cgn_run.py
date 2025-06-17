@@ -5,6 +5,7 @@ import sys
 import os
 import socket
 from scapy.all import *
+from scapy.config import conf
 from pyroute2 import netns
 
 
@@ -79,11 +80,24 @@ def pub_test_udp():
 def priv_test_udp():
     p = Ether(src="d2:f0:0c:ba:a5:00", dst="d2:ad:ca:fe:b4:01") / \
     IP(src="10.0.0.1", dst="8.8.8.8") / \
-    UDP(sport=2000, dport=99) / ("DATADATA")
+    UDP(sport=2000, dport=99) / Raw("DATADATA")
 
     r = srp1(p, iface="priv", verbose=0, timeout=2)
     check_cksum(r, "UDP")
     print("test udp finished")
+
+
+#######
+
+def test_ip6_exthdr():
+    p = Ether(src="d2:f0:0c:ba:a5:00", dst="d2:ad:ca:fe:b4:01") / \
+    IPv6(src="2002::65", dst="2001::8:8:8:8") / \
+    IPv6ExtHdrHopByHop() / \
+    IPv6ExtHdrRouting() / \
+    ICMPv6EchoRequest()
+    r = srp1(p, iface="priv", verbose=2, timeout=2, nofilter=1)
+    assert r != None
+    print("ip6 skip opt ok")
 
 
 
@@ -97,5 +111,8 @@ match sys.argv[1] if len(sys.argv) > 1 else "":
         test_icmp_err()
     case "udp":
         run_on_both_side(pub_test_udp, priv_test_udp)
+    case "ip6_exthdr":
+        netns.setns('cgn-priv')
+        test_ip6_exthdr();
     case _:
         print("give me a valid command!")

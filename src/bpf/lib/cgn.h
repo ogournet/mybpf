@@ -13,6 +13,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+#include "flow.h"
 #include "cgn-def.h"
 
 
@@ -528,9 +529,6 @@ _flow_alloc(struct cgn_user *u, const struct cgn_packet *pp)
 	ret = bpf_timer_set_callback(&f->timer, _flow_timer_cb);
 	if (ret)
 		goto err;
-	ret = bpf_timer_start(&f->timer, 20ULL * 1000 * 1000 * 1000, 0);
-	if (ret)
-		goto err;
 
 	return f;
 
@@ -587,6 +585,7 @@ cgn_flow_handle_priv(struct cgn_packet *cp)
 {
 	struct cgn_user *u;
 	struct cgn_v4_flow_priv *f;
+	int ret;
 
 	u = _user_v4_lookup(cp->src_addr);
 	if (u == NULL) {
@@ -604,11 +603,43 @@ cgn_flow_handle_priv(struct cgn_packet *cp)
 		f = _flow_alloc(u, cp);
 		if (f == NULL)
 			return 12;
+
+	} else if (cp->proto == IPPROTO_TCP) {
+		if (flow_update_priv_tcp_state(cp->tcp_flags, &f->proto_state)) {
+			struct cgn_v4_flow_pub_key pub_k = {
+				.cgn_addr = f->cgn_addr,
+				.pub_addr = cp->dst_addr,
+				.cgn_port = f->cgn_port,
+				.pub_port = cp->dst_port,
+				.proto = cp->proto,
+			};
+			struct cgn_v4_flow_pub *pub_f;
+			pub_f = bpf_map_lookup_elem(&v4_pub_flows, &pub_k);
+			if (pub_f != NULL) {
+				pub_f->proto_state = f->proto_state;
+			}
+		}
 	}
 	/* XXX may apply policy or sorts of things on user */
 
 	cp->src_addr = f->cgn_addr;
 	cp->src_port = f->cgn_port;
+
+	/* start or refresh flow timeout */
+	__u64 to = flow_timeout_ns(cp->proto, cp->dst_port, f->proto_state);
+	ret = bpf_timer_start(&f->timer, to, 0);
+	if (ret) {
+		bpf_printk("cannot (re)start timer??? (val=%ld)", to);
+		struct cgn_v4_flow_priv_key priv_k = {
+			.priv_addr = cp->src_addr,
+			.pub_addr = cp->dst_addr,
+			.priv_port = cp->src_port,
+			.pub_port = cp->dst_port,
+			.proto = cp->proto,
+		};
+		_flow_release(&priv_k, f);
+		return 12;
+	}
 
 	return 0;
 }
@@ -631,6 +662,22 @@ cgn_flow_handle_pub(struct cgn_packet *cp)
 	f = _flow_v4_lookup_pub(cp);
 	if (f == NULL)
 		return 10;
+
+	if (cp->proto == IPPROTO_TCP) {
+		if (flow_update_pub_tcp_state(cp->tcp_flags, &f->proto_state)) {
+			struct cgn_v4_flow_priv_key priv_k = {
+				.priv_addr = f->priv_addr,
+				.pub_addr = cp->src_addr,
+				.priv_port = f->priv_port,
+				.pub_port = cp->src_port,
+				.proto = cp->proto,
+			};
+			struct cgn_v4_flow_priv *priv_f;
+			priv_f = bpf_map_lookup_elem(&v4_priv_flows, &priv_k);
+			if (priv_f != NULL)
+				priv_f->proto_state = f->proto_state;
+		}
+	}
 
 	u = _user_v4_lookup(f->priv_addr);
 	if (f == NULL) {
@@ -886,7 +933,9 @@ cgn_pkt_handle(struct xdp_md *ctx, struct iphdr *ip4h, __u8 from_priv)
 {
 	void *data_end = (void *)(long)ctx->data_end;
 	struct udphdr *udp;
+	struct tcphdr *tcp;
 	struct icmphdr *icmp;
+	void *payload;
 	int ret;
 
 	struct cgn_packet cp = {
@@ -894,24 +943,33 @@ cgn_pkt_handle(struct xdp_md *ctx, struct iphdr *ip4h, __u8 from_priv)
 		.proto = ip4h->protocol,
 		.from_priv = from_priv,
 		.src_addr = bpf_ntohl(ip4h->saddr),
-		.dst_addr = bpf_ntohl(ip4h->daddr),
+		.dst_addr = bpf_ntohl(ip4h->daddr)
 	};
-
-	udp = (void *)(ip4h) + ip4h->ihl * 4;
-	if ((void *)(udp + 1) > data_end)
-		return 1;
+	payload = (void *)ip4h + ip4h->ihl * 4;
 
 	/* bpf_printk("priv:%d parse proto: %d dst: %x ihl %d/%d", from_priv, */
 	/* 	   cp.proto, ip4h->daddr, ip4h->ihl, ip4h->version); */
 
 	switch (cp.proto) {
 	case IPPROTO_UDP:
-	case IPPROTO_TCP:
+		udp = payload;
+		if ((void *)(udp + 1) > data_end)
+			return 1;
 		cp.src_port = bpf_ntohs(udp->source);
 		cp.dst_port = bpf_ntohs(udp->dest);
 		break;
+	case IPPROTO_TCP:
+		tcp = payload;
+		if ((void *)(tcp + 1) > data_end)
+			return 1;
+		cp.src_port = bpf_ntohs(tcp->source);
+		cp.dst_port = bpf_ntohs(tcp->dest);
+		cp.tcp_flags = ((union tcp_word_hdr *)(tcp))->words[3];
+		break;
 	case IPPROTO_ICMP:
-		icmp = (struct icmphdr *)udp;
+		icmp = payload;
+		if ((void *)(icmp + 1) > data_end)
+			return 1;
 		switch (icmp->type) {
 		case ICMP_ECHO:
 			cp.src_port = bpf_ntohs(icmp->un.echo.id);
@@ -945,6 +1003,5 @@ cgn_pkt_handle(struct xdp_md *ctx, struct iphdr *ip4h, __u8 from_priv)
 			return ret;
 		ret = cgn_pkt_rewrite_dst(&cp, ip4h, udp, cp.dst_addr, cp.dst_port);
 	}
-
 	return ret;
 }

@@ -14,6 +14,7 @@
 #include "mybpf-priv.h"
 #include "cgn.h"
 #include "bpf/lib/cgn-def.h"
+#include "bpf/lib/flow-def.h"
 
 
 struct cgn_ctx
@@ -22,6 +23,7 @@ struct cgn_ctx
 	struct bpf_map *block_map;
 	struct bpf_map *free_block_map;
 	struct bpf_map *user_map;
+	struct bpf_map *flow_map;
 	uint32_t ipblock_n;
 	uint32_t block_count;
 	uint32_t block_size;
@@ -30,14 +32,23 @@ struct cgn_ctx
 };
 
 
+struct init_var_set
+{
+	const char *name;
+	uint8_t type;		/* 1:u32, 2:u64 */
+	const void *value;
+};
 
 static void
-_set_const_var(struct bpf_object *obj, uint32_t ipbl_n, uint32_t bl_n, uint32_t port_count,
-	       uint32_t bl_flow_max)
+_set_const_var(struct bpf_object *obj, const struct init_var_set *consts)
 {
 	struct bpf_map *map;
 	void *rodata;
-	int set = 0;
+	struct btf *btf;
+	const struct btf_type *sec;
+	struct btf_var_secinfo *secinfo;
+	int sec_id, i, j;
+	int set = 0, to_be_set = 0;
 
 	/* this open() subskeleton is only here to retrieve map's mmap address
 	 * libbpf doesn't provide other way to get this address */
@@ -59,11 +70,6 @@ _set_const_var(struct bpf_object *obj, uint32_t ipbl_n, uint32_t bl_n, uint32_t 
 	}
 
 	/* now use btf info to find this variable */
-	struct btf *btf;
-	const struct btf_type *sec;
-	struct btf_var_secinfo *secinfo;
-	int sec_id, i;
-
 	btf = bpf_object__btf(obj);
 	if (btf == NULL)
 		return;
@@ -83,23 +89,27 @@ _set_const_var(struct bpf_object *obj, uint32_t ipbl_n, uint32_t bl_n, uint32_t 
 	for (i = 0; i < btf_vlen(sec); i++) {
 		const struct btf_type *t = btf__type_by_id(btf, secinfo[i].type);
 		const char *name = btf__name_by_offset(btf, t->name_off);
-		if (!strcmp(name, "ipbl_n")) {
-			*((uint32_t *)(rodata + secinfo[i].offset)) = ipbl_n;
-			++set;
-		} else if (!strcmp(name, "bl_n")) {
-			*((uint32_t *)(rodata + secinfo[i].offset)) = bl_n;
-			++set;
-		} else if (!strcmp(name, "port_count")) {
-			*((uint32_t *)(rodata + secinfo[i].offset)) = port_count;
-			++set;
-		} else if (!strcmp(name, "bl_flow_max")) {
-			*((uint32_t *)(rodata + secinfo[i].offset)) = bl_flow_max;
-			++set;
+		for (j = 0; consts[j].name != NULL; j++) {
+			if (strcmp(name, consts[j].name))
+				continue;
+			switch (consts[j].type) {
+			case 1:
+				*((uint32_t *)(rodata + secinfo[i].offset)) =
+					*(uint32_t *)consts[j].value;
+				++set;
+				break;
+			case 2:
+				*((uint64_t *)(rodata + secinfo[i].offset)) =
+					*(uint64_t *)consts[j].value;
+				++set;
+				break;
+			}
 		}
+		to_be_set = j;
 	}
 
-	if (set != 4)
-		printf("warn: not all .rodata var set!!!\n");
+	if (set < to_be_set - 1)
+		printf("warn: not all .rodata var set!!! (%d/%d)\n", set, to_be_set);
 }
 
 
@@ -107,6 +117,7 @@ struct cgn_ctx *
 cgn_ctx_create(const struct cgn_cfg *bc, struct bpf_object *obj)
 {
 	struct cgn_ctx *ctx;
+	uint64_t icmp_to;
 	int i;
 
 	if (!bc->block_size || bc->port_end <= bc->port_start) {
@@ -130,10 +141,18 @@ cgn_ctx_create(const struct cgn_cfg *bc, struct bpf_object *obj)
 		ctx->ipblock_n += 1 << (32 - bc->addr[i].netmask);
 	}
 
-	printf("set const var ipbl_n: %d bl_n: %d bl_size: %d bflow_size: %d\n",
-	       ctx->ipblock_n, ctx->block_count, bc->block_size, bc->bflow_size);
-	_set_const_var(obj, ctx->ipblock_n, ctx->block_count, bc->block_size,
-		       bc->bflow_size);
+	printf("set const var ipbl_n: %d bl_n: %d bl_size: %d flow_max: %d\n",
+	       ctx->ipblock_n, ctx->block_count, bc->block_size, bc->flow_max);
+	icmp_to = bc->timeout_icmp * 1000000000ULL;
+	struct init_var_set consts_var[] = {
+		{ .name = "ipbl_n", .type = 1, .value = &ctx->ipblock_n },
+		{ .name = "bl_n", .type = 1, .value = &ctx->block_count },
+		{ .name = "port_count", .type = 1, .value = &bc->block_size },
+		{ .name = "bl_flow_max", .type = 1, .value = &bc->flow_max },
+		{ .name = "icmp_timeout", .type = 2, .value = &icmp_to },
+		{ NULL },
+	};
+	_set_const_var(obj, consts_var);
 
 	/* 'allocate' bpf maps */
 	ctx->block_map = bpf_object__find_map_by_name(obj, "v4_blocks");
@@ -164,6 +183,11 @@ cgn_ctx_create(const struct cgn_cfg *bc, struct bpf_object *obj)
 	}
 
 	ctx->user_map = bpf_object__find_map_by_name(obj, "users");
+	ctx->flow_map = bpf_object__find_map_by_name(obj, "flow_port_timeouts");
+	if (ctx->flow_map == NULL) {
+		printf("cannot find map flow_port_timeouts\n");
+		goto err;
+	}
 
 	return ctx;
 
@@ -232,6 +256,21 @@ cgn_ctx_load(const struct cgn_ctx *ctx)
 	bpf_map__update_elem(ctx->free_block_map, &i, sizeof (i),
 			     free_area, fmsize, 0);
 	free(free_area);
+
+	/* set flow port timeout */
+	for (i = 0; i < 1 << 16; i++) {
+		union flow_timeout_config val;
+
+		k = i;
+		val.udp = ctx->c.timeout_by_port[i].udp ?: ctx->c.timeout.udp;
+		bpf_map__update_elem(ctx->flow_map, &k, sizeof (k), &val, sizeof (val), 0);
+
+		k = (1 << 16) | i;
+		val.tcp_synfin = ctx->c.timeout_by_port[i].tcp_synfin ?:
+			ctx->c.timeout.tcp_synfin;
+		val.tcp_est = ctx->c.timeout_by_port[i].tcp_est ?: ctx->c.timeout.tcp_est;
+		bpf_map__update_elem(ctx->flow_map, &k, sizeof (k), &val, sizeof (val), 0);
+	}
 
 	return 0;
 }
@@ -332,7 +371,7 @@ _test1(int fd, struct bpf_test_run_opts *rcfg)
 		/* cannot alloc more flow */
 		pp->src_port++;
 		assert(!bpf_prog_test_run_opts(fd, rcfg));
-		assert(rcfg->retval == 3);
+		assert(rcfg->retval == 12);
 
 		pp->src_addr = htonl(ntohl(pp->src_addr) + 1);
 		pp->src_port = 32000;
@@ -340,7 +379,7 @@ _test1(int fd, struct bpf_test_run_opts *rcfg)
 
 	/* no more block for 5th user */
 	assert(!bpf_prog_test_run_opts(fd, rcfg));
-	assert(rcfg->retval == 3);
+	assert(rcfg->retval == 12);
 }
 
 static void
@@ -431,7 +470,11 @@ cgn_test_init(int test, struct bpf_object *obj)
 		.port_start = 1000,
 		.port_end = 65535,
 		.block_size = 1000,
-		.bflow_size = 2000,
+		.flow_max = 2000,
+		.timeout_icmp = 120,
+		.timeout.udp = 120,
+		.timeout.tcp_synfin = 20,
+		.timeout.tcp_est = 600,
 	};
 
 	switch (test) {
@@ -439,7 +482,7 @@ cgn_test_init(int test, struct bpf_object *obj)
 		cfg.port_start = 30000;
 		cfg.port_end = 30320;
 		cfg.block_size = 20;
-		cfg.bflow_size = 20;
+		cfg.flow_max = 20;
 		addr_parse_ip("37.127.0.1/32", &cfg.addr[0].a,
 			      &cfg.addr[0].netmask, NULL, 1);
 		break;

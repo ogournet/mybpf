@@ -53,6 +53,14 @@ ip -n cgn-pub route add 37.141.0.0/24 via 192.168.61.1 dev pub
 ip -n cgn-priv addr add 192.168.61.1/24 dev priv
 ip -n cgn-priv route add default via 192.168.61.2 dev priv
 
-# otherwise there are weird thing with packet checksum sent from a
-# classic socket.
+# this script also serve for ip6fw test
+ip -n cgn-pub addr add fc:1::2/64 dev pub
+ip -n cgn-pub addr add 2001::8:8:8:8/128 dev pub
+ip -n cgn-pub route add 2002::1/16 via fc:1::1 dev pub
+ip -n cgn-priv addr add fc:1::1/64 dev priv
+ip -n cgn-priv route add default via fc:1::2 dev priv
+
+# fix weird thing with packet checksum sent from a
+# classic socket (eg SOCK_DGRAM).
 ip netns exec cgn-pub ethtool -K pub tx-checksumming off
+ip netns exec cgn-priv ethtool -K priv tx-checksumming off

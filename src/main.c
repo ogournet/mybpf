@@ -36,6 +36,7 @@ enum prg_type {
 	PRG_PKT_QUEUE,
 	PRG_IPFRAG,
 	PRG_CGN_TEST,
+	PRG_IP6FW_TEST,
 
 	PRG_MAX,
 };
@@ -283,6 +284,7 @@ static const char *prglist[PRG_MAX] = {
 	[PRG_PKT_QUEUE] = "pkt_queue",
 	[PRG_IPFRAG] = "ipfrag",
 	[PRG_CGN_TEST] = "cgn_test",
+	[PRG_IP6FW_TEST] = "ip6fw_test",
 };
 
 static const struct option long_options[] = {

@@ -11,13 +11,25 @@ struct block_addr_cfg
 	uint32_t		netmask;
 };
 
+/* timeout in seconds */
+struct port_timeout_config
+{
+	uint16_t udp;
+	uint16_t tcp_synfin;
+	uint16_t tcp_est;
+};
+
 struct cgn_cfg
 {
 	struct block_addr_cfg   addr[16];
 	uint16_t		port_start;
 	uint16_t		port_end;
 	uint32_t		block_size;		/* # of port per block */
-	uint32_t		bflow_size;		/* # of flow per block */
+	uint32_t		flow_max;		/* max # of flow per user */
+
+	struct port_timeout_config timeout;
+	struct port_timeout_config timeout_by_port[0x10000];
+	uint16_t		timeout_icmp;
 };
 
 
