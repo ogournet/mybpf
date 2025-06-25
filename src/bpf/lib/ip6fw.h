@@ -6,12 +6,26 @@
 #include <linux/in.h>
 #include <linux/ipv6.h>
 #include <linux/udp.h>
+#include <linux/tcp.h>
 #include <linux/icmpv6.h>
 
 #include <linux/bpf.h>
 
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+
+#include "flow.h"
+
+
+/* all address/port in cpu order */
+struct ip6fw_packet
+{
+	struct ipv6hdr *ip6h;
+	__u16		src_port;
+	__u16		dst_port;
+	__u32		tcp_flags;
+	__u8		proto;
+};
 
 
 /*
@@ -26,11 +40,12 @@ struct ip6fw_flow_key {
 	__u16			priv_port;
 	__u16			pub_port;
 	__u8			proto;
-};
+} __attribute__((packed));
 
 struct ip6fw_flow {
 	struct bpf_timer	timer;		/* flow expiration */
 	__u64			created;
+	__u8			proto_state;
 };
 
 struct {
@@ -76,9 +91,6 @@ _flow_alloc(const struct ip6fw_flow_key *k)
 	ret = bpf_timer_set_callback(&f->timer, _flow_timer_cb);
 	if (ret)
 		goto err;
-	ret = bpf_timer_start(&f->timer, 20ULL * 1000 * 1000 * 1000, 0);
-	if (ret)
-		goto err;
 
 	return f;
 
@@ -89,50 +101,65 @@ _flow_alloc(const struct ip6fw_flow_key *k)
 }
 
 static int
-ip6fw_flow_handle_priv(struct ipv6hdr *ip6h, __u8 nh, __u16 src_port, __u16 dst_port)
+ip6fw_flow_handle_priv(struct ip6fw_packet *pp)
 {
 	struct ip6fw_flow_key k = {
-		.priv_port = src_port,
-		.pub_port = dst_port,
-		.proto = nh,
+		.priv_port = pp->src_port,
+		.pub_port = pp->dst_port,
+		.proto = pp->proto,
 	};
 	struct ip6fw_flow *f;
 
-	__builtin_memcpy(k.priv_addr.addr, ip6h->saddr.s6_addr, 16);
-	__builtin_memcpy(k.pub_addr.addr, ip6h->daddr.s6_addr, 16);
+	__builtin_memcpy(k.priv_addr.addr, pp->ip6h->saddr.s6_addr, 16);
+	__builtin_memcpy(k.pub_addr.addr, pp->ip6h->daddr.s6_addr, 16);
 
 	/* create flow if it doesn't exist */
 	f = bpf_map_lookup_elem(&v6_flows, &k);
 	bpf_printk("lookup priv with proto %d port priv %d pub %d  f = %p",
-		   nh, src_port, dst_port, f);
+		   pp->proto, pp->src_port, pp->dst_port, f);
  	if (f == NULL) {
 		f = _flow_alloc(&k);
 		if (f == NULL)
 			return 12;
 	}
 
+	if (pp->proto == IPPROTO_TCP)
+		flow_update_priv_tcp_state(pp->tcp_flags, &f->proto_state);
+
+	/* start or refresh flow timeout */
+	__u64 to = flow_timeout_ns(pp->proto, pp->dst_port, f->proto_state);
+	int ret = bpf_timer_start(&f->timer, to, 0);
+	if (ret) {
+		bpf_printk("cannot (re)start timer??? (val=%ld)", to);
+		bpf_map_delete_elem(&v6_flows, &k);
+		return 12;
+	}
+
 	return 0;
 }
 
 static int
-ip6fw_flow_handle_pub(struct ipv6hdr *ip6h, __u8 nh, __u16 src_port, __u16 dst_port)
+ip6fw_flow_handle_pub(struct ip6fw_packet *pp)
 {
 	struct ip6fw_flow_key k = {
-		.priv_port = dst_port,
-		.pub_port = src_port,
-		.proto = nh,
+		.priv_port = pp->dst_port,
+		.pub_port = pp->src_port,
+		.proto = pp->proto,
 	};
 	struct ip6fw_flow *f;
 
-	__builtin_memcpy(k.priv_addr.addr, ip6h->daddr.s6_addr, 16);
-	__builtin_memcpy(k.pub_addr.addr, ip6h->saddr.s6_addr, 16);
+	__builtin_memcpy(k.priv_addr.addr, pp->ip6h->daddr.s6_addr, 16);
+	__builtin_memcpy(k.pub_addr.addr, pp->ip6h->saddr.s6_addr, 16);
 
 	/* reject if flow doesn't exist */
 	f = bpf_map_lookup_elem(&v6_flows, &k);
 	bpf_printk("pub check with proto %d port priv %d pub %d  f = %p",
-		   nh, dst_port, src_port, f);
+		   pp->proto, pp->dst_port, pp->src_port, f);
 	if (f == NULL)
 		return 10;
+
+	if (pp->proto == IPPROTO_TCP)
+		flow_update_pub_tcp_state(pp->tcp_flags, &f->proto_state);
 
 	return 0;
 }
@@ -202,24 +229,25 @@ _ip6fw_handle_icmp_err(struct xdp_md *ctx, struct ipv6hdr *outer_ip6h,
 	void *payload;
 	struct udphdr *udp;
 	struct icmp6hdr *icmp6;
-	__u16 src_port, dst_port;
-	__u8 nh;
+	struct ip6fw_packet pp = {
+		.ip6h = outer_ip6h
+	};
 
 	if ((void *)(ip6h + 1) > data_end)
 		return 1;
 
-	payload = ipv6_skip_exthdr(ctx, ip6h, &nh);
+	payload = ipv6_skip_exthdr(ctx, ip6h, &pp.proto);
 	if (payload == NULL)
 		return 1;
 
-	switch (nh) {
+	switch (pp.proto) {
 	case IPPROTO_UDP:
 	case IPPROTO_TCP:
 		udp = payload;
 		if ((void *)(udp + 1) > data_end)
 			return 1;
-		src_port = bpf_ntohs(udp->source);
-		dst_port = bpf_ntohs(udp->dest);
+		pp.dst_port = bpf_ntohs(udp->source);
+		pp.src_port = bpf_ntohs(udp->dest);
 		break;
 
 	case IPPROTO_ICMPV6:
@@ -229,12 +257,12 @@ _ip6fw_handle_icmp_err(struct xdp_md *ctx, struct ipv6hdr *outer_ip6h,
 
 		switch (icmp6->icmp6_type) {
 		case ICMPV6_ECHO_REQUEST:
-			src_port = bpf_ntohs(icmp6->icmp6_identifier);
-			dst_port = 0;
+			pp.dst_port = bpf_ntohs(icmp6->icmp6_identifier);
+			pp.src_port = 0;
 			break;
 		case ICMPV6_ECHO_REPLY:
-			src_port = 0;
-			dst_port = bpf_ntohs(icmp6->icmp6_identifier);
+			pp.dst_port = 0;
+			pp.src_port = bpf_ntohs(icmp6->icmp6_identifier);
 			break;
 		default:
 			return 2;
@@ -246,9 +274,9 @@ _ip6fw_handle_icmp_err(struct xdp_md *ctx, struct ipv6hdr *outer_ip6h,
 	}
 
 	if (from_priv)
-		return ip6fw_flow_handle_priv(outer_ip6h, nh, dst_port, src_port);
+		return ip6fw_flow_handle_priv(&pp);
 	else
-		return ip6fw_flow_handle_pub(outer_ip6h, nh, dst_port, src_port);
+		return ip6fw_flow_handle_pub(&pp);
 }
 
 
@@ -271,22 +299,32 @@ ip6fw_pkt_handle(struct xdp_md *ctx, struct ipv6hdr *ip6h, __u8 from_priv)
 	void *data_end = (void *)(long)ctx->data_end;
 	void *payload;
 	struct udphdr *udp;
+	struct tcphdr *tcp;
 	struct icmp6hdr *icmp6;
-	__u16 src_port = 0, dst_port = 0;
-	__u8 nh;
+	struct ip6fw_packet pp = {
+		.ip6h = ip6h
+	};
 
-	payload = ipv6_skip_exthdr(ctx, ip6h, &nh);
+	payload = ipv6_skip_exthdr(ctx, ip6h, &pp.proto);
 	if (payload == NULL)
 		return 1;
 
-	switch (nh) {
+	switch (pp.proto) {
 	case IPPROTO_UDP:
-	case IPPROTO_TCP:
 		udp = payload;
 		if ((void *)(udp + 1) > data_end)
 			return 1;
-		src_port = bpf_ntohs(udp->source);
-		dst_port = bpf_ntohs(udp->dest);
+		pp.src_port = bpf_ntohs(udp->source);
+		pp.dst_port = bpf_ntohs(udp->dest);
+		break;
+
+	case IPPROTO_TCP:
+		tcp = payload;
+		if ((void *)(tcp + 1) > data_end)
+			return 1;
+		pp.src_port = bpf_ntohs(tcp->source);
+		pp.dst_port = bpf_ntohs(tcp->dest);
+		pp.tcp_flags = ((union tcp_word_hdr *)(tcp))->words[3];
 		break;
 
 	case IPPROTO_ICMPV6:
@@ -298,13 +336,13 @@ ip6fw_pkt_handle(struct xdp_md *ctx, struct ipv6hdr *ip6h, __u8 from_priv)
 		case ICMPV6_ECHO_REQUEST:
 			if (!from_priv)
 				return 2;
-			src_port = bpf_ntohs(icmp6->icmp6_identifier);
-			dst_port = 0;
+			pp.src_port = bpf_ntohs(icmp6->icmp6_identifier);
+			pp.dst_port = 0;
 			break;
 
 		case ICMPV6_ECHO_REPLY:
-			src_port = 0;
-			dst_port = bpf_ntohs(icmp6->icmp6_identifier);
+			pp.src_port = 0;
+			pp.dst_port = bpf_ntohs(icmp6->icmp6_identifier);
 			break;
 
 		case ICMPV6_DEST_UNREACH:
@@ -329,9 +367,9 @@ ip6fw_pkt_handle(struct xdp_md *ctx, struct ipv6hdr *ip6h, __u8 from_priv)
 	}
 
 	if (from_priv)
-		return ip6fw_flow_handle_priv(ip6h, nh, src_port, dst_port);
+		return ip6fw_flow_handle_priv(&pp);
 	else
-		return ip6fw_flow_handle_pub(ip6h, nh, src_port, dst_port);
+		return ip6fw_flow_handle_pub(&pp);
 
 	return 0;
 }

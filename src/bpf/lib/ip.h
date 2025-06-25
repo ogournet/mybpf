@@ -2,6 +2,13 @@
 
 #pragma once
 
+
+struct vlan_hdr {
+	__be16		vlan_tci;
+	__be16		next_proto;
+};
+
+
 #define	IP_MF 0x2000			/* more fragments flag */
 #define	IP_OFFMASK 0x1fff		/* mask for fragmenting bits */
 

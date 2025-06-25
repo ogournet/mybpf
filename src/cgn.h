@@ -33,9 +33,12 @@ struct cgn_cfg
 };
 
 
-/* block.c */
+/* cgn.c */
 struct cgn_ctx *cgn_ctx_create(const struct cgn_cfg *bc, struct bpf_object *oprg);
 int cgn_ctx_load(const struct cgn_ctx *ctx);
 void cgn_ctx_dump(const struct cgn_ctx *ctx, int full);
 void cgn_test_init(int test, struct bpf_object *obj);
 int cgn_test_start(int test, struct bpf_object *obj);
+
+/* cgn_ctl.c */
+int cgn_ctl_process_cmd(int argc, char **argv);

@@ -70,6 +70,7 @@ flow_timeout_ns(__u8 proto, __u16 port, __u8 state)
 	case IPPROTO_TCP:
 		return flow_tcp_timeout_ns(port, state);
 	case IPPROTO_ICMP:
+	case IPPROTO_ICMPV6:
 	default:
 		return flow_icmp_timeout_ns();
 	}
@@ -86,7 +87,7 @@ flow_timeout_ns(__u8 proto, __u16 port, __u8 state)
 static inline int
 flow_update_priv_tcp_state(__u32 tcp_flags, __u8 *proto_state)
 {
-	if (tcp_flags & (TCP_FLAG_RST | TCP_FLAG_FIN) && *proto_state == 1) {
+	if (tcp_flags & (TCP_FLAG_RST | TCP_FLAG_FIN)) {
 		*proto_state = 2;
 		return 1;
 	}
@@ -102,7 +103,7 @@ flow_update_pub_tcp_state(__u32 tcp_flags, __u8 *proto_state)
 		*proto_state = 1;
 		return 1;
 
-	} else if (tcp_flags & (TCP_FLAG_RST | TCP_FLAG_FIN) && *proto_state == 1) {
+	} else if (tcp_flags & (TCP_FLAG_RST | TCP_FLAG_FIN)) {
 		*proto_state = 2;
 		return 1;
 	}

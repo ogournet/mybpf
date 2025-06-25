@@ -373,7 +373,7 @@ _test1(int fd, struct bpf_test_run_opts *rcfg)
 		assert(!bpf_prog_test_run_opts(fd, rcfg));
 		assert(rcfg->retval == 12);
 
-		pp->src_addr = htonl(ntohl(pp->src_addr) + 1);
+		pp->src_addr++;
 		pp->src_port = 32000;
 	}
 
@@ -431,8 +431,8 @@ _test3(void *varg)
 
 	printf("start test3: %d\n", arg->id);
 
-	pp.src_addr = 0x0a000001;
-	pp.dst_addr = 0x08080808;
+	pp.src_addr = 0x0100000a;
+	pp.dst_addr = 0x04040408;
 	pp.src_port = 13555;
 	pp.dst_port = 80;
 	pp.from_priv = 1;
@@ -453,7 +453,7 @@ _test3(void *varg)
 			}
 		}
 
-		pp.src_addr = htonl(ntohl(pp.src_addr) + 1);
+		pp.src_addr++;
 		pp.src_port = 10000 + arg->id * 1000;
 	}
 
