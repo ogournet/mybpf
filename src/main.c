@@ -36,6 +36,7 @@ enum prg_type {
 	PRG_PKT_QUEUE,
 	PRG_IPFRAG,
 	PRG_CGN_TEST,
+	PRG_CGN,
 	PRG_IP6FW_TEST,
 
 	PRG_MAX,
@@ -50,6 +51,7 @@ static struct ev_signal ev_sigint;
 static int sigint;
 static struct bpf_object *bo;
 static struct pq_ctx *pq_ctx;
+static struct cgn_ctx *cgn_ctx;
 
 /*
  * change current network namespace for this process.
@@ -284,6 +286,7 @@ static const char *prglist[PRG_MAX] = {
 	[PRG_PKT_QUEUE] = "pkt_queue",
 	[PRG_IPFRAG] = "ipfrag",
 	[PRG_CGN_TEST] = "cgn_test",
+	[PRG_CGN] = "cgn",
 	[PRG_IP6FW_TEST] = "ip6fw_test",
 };
 
@@ -350,6 +353,9 @@ int main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 	const char *prgname = argc > 0 ? argv[0] : "";
+
+	if (!strcmp(prgname, "cgnctl"))
+		return cgn_ctl_process_cmd(argc - 1, argv + 1);
 
 	/* program to load */
 	for (prgtype = 0; prgtype < PRG_MAX; prgtype++) {
@@ -444,6 +450,25 @@ int main(int argc, char **argv)
 		cgn_test_init(test_id, bo);
 		break;
 
+	case PRG_CGN:
+		struct cgn_cfg cfg = {
+			.port_start = 1500,
+			.port_end = 65500,
+			.block_size = 500,
+			.flow_max = 2000,
+			.timeout_icmp = 120,
+			.timeout.udp = 120,
+			.timeout.tcp_synfin = 20,
+			.timeout.tcp_est = 600,
+		};
+		addr_parse_ip("37.169.192.0/22", &cfg.addr[0].a,
+			      &cfg.addr[0].netmask, NULL, 1);
+		cgn_ctx = cgn_ctx_create(&cfg, bo);
+		if (cgn_ctx == NULL)
+			goto err;
+		break;
+
+
 	default:
 		break;
 	}
@@ -462,6 +487,11 @@ int main(int argc, char **argv)
 	/* load bpf into kernel (create maps, verifier, ...) */
 	if (bpf_object__load(bo) < 0)
 		goto err;
+
+	/* remove existing pin, then create fresh ones */
+	bpf_object__unpin_maps(bo, "/sys/fs/bpf/mybpf");
+	if (bpf_object__pin_maps(bo, "/sys/fs/bpf/mybpf") < 0)
+		printf("cannot pin maps: %m\n");
 
 	/* action to make after loading into kernel, but before attaching
 	 * (starting) program */
@@ -490,6 +520,11 @@ int main(int argc, char **argv)
 
 	case PRG_CGN_TEST:
 		if ((ret = cgn_test_start(test_id, bo)) <= 0)
+			goto err;
+		break;
+
+	case PRG_CGN:
+		if (cgn_ctx_load(cgn_ctx) < 0)
 			goto err;
 		break;
 

@@ -1,7 +1,7 @@
 
 fs = import('fs')
 
-bpf_sources = files('pass.c', 'map_resize.c', 'cpumap.c', 'signal.c', 'bpf_var.c', 'pkt_queue.c', 'ipfrag.c', 'cgn_test.c', 'ip6fw_test.c')
+bpf_sources = files('pass.c', 'map_resize.c', 'cpumap.c', 'signal.c', 'bpf_var.c', 'pkt_queue.c', 'ipfrag.c', 'cgn_test.c', 'ip6fw_test.c', 'cgn.c', 'cgn-dpdk.c')
 
 bpf_libs = files('lib/ip.h', 'lib/cgn-def.h', 'lib/cgn.h', 'lib/ip6fw.h', 'lib/flow.h')
 
