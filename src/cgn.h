@@ -24,8 +24,9 @@ struct cgn_cfg
 	struct block_addr_cfg   addr[16];
 	uint16_t		port_start;
 	uint16_t		port_end;
-	uint32_t		block_size;		/* # of port per block */
-	uint32_t		flow_max;		/* max # of flow per user */
+	uint32_t		block_size;	/* # of port per block */
+	uint32_t		flow_per_user;	/* max # of flow per user */
+	uint8_t			block_per_user;	/* max # of blocks per user */
 
 	struct port_timeout_config timeout;
 	struct port_timeout_config timeout_by_port[0x10000];

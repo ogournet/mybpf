@@ -18,10 +18,11 @@
 
 
 /* cfg set from userspace */
-const volatile __u32 ipbl_n = 1;	/* # of ip in pool */
+const volatile __u32 ipbl_n = 1;	/* # of ips in pool */
 const volatile __u32 bl_n = 2;		/* # of blocks per ip */
 const volatile __u32 port_count = 3;	/* # ports per block */
 const volatile __u32 bl_flow_max = 4;	/* # of allocatable flow per block  */
+const volatile __u8 bl_user_max = CGN_USER_BLOCKS_MAX;
 
 /* locals */
 int hit_bug;
@@ -39,51 +40,37 @@ struct {
 } users SEC(".maps");
 
 
-static struct cgn_user *
-_user_v4_lookup(__u32 addr)
+static inline struct cgn_user *
+_cgn_user_lookup(__u32 addr)
 {
-	struct cgn_user_key uk = {
-		.addr.ip4 = addr,
-		.flags = 0,
-	};
-
-	return bpf_map_lookup_elem(&users, &uk);
+	return bpf_map_lookup_elem(&users, &addr);
 }
 
-static struct cgn_user *
-_user_v4_alloc(__u32 addr)
+static inline struct cgn_user *
+_cgn_user_alloc(__u32 addr)
 {
-	struct cgn_user_key uk = {
-		.addr.ip4 = addr,
-		.flags = 0,
-	};
 	struct cgn_user u = {
-		.addr.ip4 = addr,
-		.flags = 0,
+		.created = bpf_ktime_get_ns(),
+		.addr = addr,
 	};
 	int ret;
 
-	ret = bpf_map_update_elem(&users, &uk, &u, BPF_NOEXIST);
+	ret = bpf_map_update_elem(&users, &addr, &u, BPF_NOEXIST);
 	if (ret < 0) {
 		if (ret == -EEXIST)
-			return _user_v4_lookup(addr);
-		bpf_printk("cannot allocate user: %d", ret);
+			return _cgn_user_lookup(addr);
+		bpf_printk("cannot allocate user 0x%08x: %d", addr, ret);
 		return NULL;
 	}
 
-	return _user_v4_lookup(addr);
+	return _cgn_user_lookup(addr);
 }
 
-static void
-_user_v4_release(struct cgn_user *u)
+static inline void
+_cgn_user_release(struct cgn_user *u)
 {
-	struct cgn_user_key uk = {
-		.addr.ip4 = u->addr.ip4,
-		.flags = 0,
-	};
-
-	/* bpf_printk("release user %x", u->addr.ip4); */
-	bpf_map_delete_elem(&users, &uk);
+	/* bpf_printk("release user %x", u->addr); */
+	bpf_map_delete_elem(&users, &u->addr);
 }
 
 
@@ -115,30 +102,71 @@ struct {
 
 
 static inline int
-_block_lookup(struct cgn_user_allocated_blocks ub,
+_block_lookup(__u32 ipbl_idx, __u32 bl_idx,
 	      struct cgn_v4_ipblock **out_ipbl,
 	      struct cgn_v4_block **out_bl)
 {
 	struct cgn_v4_ipblock *ipbl;
 
-	ipbl = bpf_map_lookup_elem(&v4_blocks, &ub.ipbl_idx);
+	ipbl = bpf_map_lookup_elem(&v4_blocks, &ipbl_idx);
 	if (ipbl == NULL)
 		return -1;
 
-	if (ub.bl_idx >= bl_n)
+	if (bl_idx >= bl_n)
 		return -1;
 	*out_ipbl = ipbl;
-	*out_bl = &ipbl->b[ub.bl_idx];
+	*out_bl = &ipbl->b[bl_idx];
 	return 0;
+}
+
+static inline int
+_block_alloc_sub(struct cgn_user *u, struct cgn_v4_ipblock *ipbl,
+		 struct cgn_v4_block **out_bl)
+{
+	struct cgn_v4_block *bl;
+	__u32 ipbl_idx;
+	__u32 bl_idx, i;
+
+	/* get a block from this ipblock */
+	bl_idx = ipbl->next;
+	for (i = 0; i < bl_n; i++) {
+		if (bl_idx >= bl_n)
+			goto bug;
+		bl = &ipbl->b[bl_idx];
+		++bl_idx;
+		bl_idx %= bl_n;
+		if (!bl->refcnt)
+			break;
+	}
+	if (i == bl_n)
+		goto bug;
+	ipbl->next = bl_idx;
+	ipbl_idx = ipbl->ipbl_idx;
+
+	/* assign to user */
+	__u8 block_n = u->block_n;
+	if (block_n >= bl_user_max)
+		goto bug;
+	u->ipblock_idx = ipbl_idx;
+	u->block_idx[block_n] = bl->bl_idx;
+	++u->block_n;
+
+	*out_bl = bl;
+
+	return 0;
+
+ bug:
+	bpf_printk("_block_alloc_sub bug!");
+	hit_bug = 1;
+	return -2;
 }
 
 
 static inline int
-_block_alloc_sub(struct cgn_user *u, __u32 *frd_from, __u32 *frd_to,
-		 struct cgn_v4_ipblock **out_ipbl, struct cgn_v4_block **out_bl)
+_block_alloc_first(struct cgn_user *u, __u32 *frd_from, __u32 *frd_to,
+		   struct cgn_v4_ipblock **out_ipbl, struct cgn_v4_block **out_bl)
 {
 	struct cgn_v4_ipblock *ipbl;
-	struct cgn_v4_block *bl;
 	__u32 ipblock_idx;
 	__u32 *fdata;
 	__u32 idx, i;
@@ -150,10 +178,10 @@ _block_alloc_sub(struct cgn_user *u, __u32 *frd_from, __u32 *frd_to,
 
 	bpf_spin_lock(lock);
 
-	/* re-check if not empty, under lock */
+	/* under lock, re-check if this array is not empty  */
 	if (frd_from[0] == frd_from[1]) {
 		bpf_spin_unlock(lock);
-		return 1;
+		return 2;
 	}
 
 	/* move from v4_free_block[i]... (inc begin index) */
@@ -176,34 +204,10 @@ _block_alloc_sub(struct cgn_user *u, __u32 *frd_from, __u32 *frd_to,
 	ipbl = bpf_map_lookup_elem(&v4_blocks, &ipblock_idx);
 	if (ipbl == NULL)
 		goto bug;
-	idx = ipbl->next;
-	for (int i = 0; i < bl_n; i++) {
-		if (idx >= bl_n)
-			goto bug;
-		bl = &ipbl->b[idx];
-		if (!bl->refcnt)
-			break;
-		++idx;
-		idx %= bl_n;
-	}
 
-	/* assign to user */
-	__u32 block_n = u->block_n;
-	if (block_n >= CGN_USER_BLOCKS_MAX)
-		goto bug;
-	u->block[block_n].ipbl_idx = ipblock_idx;
-	u->block[block_n].bl_idx = idx;
-	++u->block_n;
-
-	++idx;
-	idx %= bl_n;
-	ipbl->next = idx;
-	ipbl->used++;
-
+	++ipbl->used;
 	*out_ipbl = ipbl;
-	*out_bl = bl;
-
-	return 0;
+	return _block_alloc_sub(u, ipbl, out_bl);
 
  bug_unlock:
 	bpf_spin_unlock(lock);
@@ -215,52 +219,172 @@ _block_alloc_sub(struct cgn_user *u, __u32 *frd_from, __u32 *frd_to,
 
 
 static inline int
+_block_alloc_more(struct cgn_user *u, struct cgn_v4_ipblock *ipbl,
+		  struct cgn_v4_block **out_bl)
+{
+	__u32 i, idx, block_n;
+	__u32 *frd_from, *frd_to;
+	__u32 ipbl_idx_to_move = ~0, ipbl_fr_idx, ipbl_old_fr_idx;
+	__u32 l_ipbl_n;
+
+	/* take lock to update v4_free_block */
+	idx = 0;
+	struct bpf_spin_lock *lock = bpf_map_lookup_elem(&v4_block_lock, &idx);
+	if (lock == NULL)
+		goto bug;
+
+	idx = ipbl->used;
+	frd_from = bpf_map_lookup_elem(&v4_free_blocks, &idx);
+	++idx;
+	frd_to = bpf_map_lookup_elem(&v4_free_blocks, &idx);
+	if (frd_from == NULL || frd_to == NULL)
+		goto bug;
+
+	l_ipbl_n = ipbl_n;
+
+	bpf_spin_lock(lock);
+
+	/* check for racy condition */
+	if (idx - 1 != ipbl->used) {
+		bpf_spin_unlock(lock);
+		bpf_printk("alloc_more race");
+		return 1;
+	}
+
+	/* move us from v4_free_block[i] ... */
+	if (ipbl->fr_idx != frd_from[0]) {
+		if (frd_from[0] > l_ipbl_n || ipbl->fr_idx > l_ipbl_n)
+			goto bug_unlock;
+		ipbl_idx_to_move = frd_from[frd_from[0] + 2];
+		frd_from[ipbl->fr_idx + 2] = ipbl_idx_to_move;
+		ipbl_old_fr_idx = frd_from[0];
+		ipbl_fr_idx = ipbl->fr_idx;
+	}
+	if (++frd_from[0] == l_ipbl_n + 1)
+		frd_from[0] = 0;
+
+	/* ... to v4_free_block[i + 1] */
+	++ipbl->used;
+	ipbl->fr_idx = frd_to[1];
+	if (frd_to[1] > l_ipbl_n)
+		goto bug_unlock;
+	frd_to[frd_to[1] + 2] = ipbl->ipbl_idx;
+	if (++frd_to[1] == l_ipbl_n + 1)
+		frd_to[1] = 0;
+
+	bpf_spin_unlock(lock);
+
+	if (ipbl_idx_to_move != ~0) {
+		struct cgn_v4_ipblock *ipbl_to_move;
+		ipbl_to_move = bpf_map_lookup_elem(&v4_blocks, &ipbl_idx_to_move);
+		if (ipbl_to_move == NULL)
+			goto bug;
+
+		bpf_spin_lock(lock);
+		/* block was used (++used or --used) since we take a ref on it
+		 * if it happens, then a refcount on ipblock should be added */
+		if (ipbl_to_move->fr_idx != ipbl_old_fr_idx)
+			goto bug_unlock;
+		ipbl_to_move->fr_idx = ipbl_fr_idx;
+		bpf_spin_unlock(lock);
+	}
+
+	/* get a block from this ipblock */
+	return _block_alloc_sub(u, ipbl, out_bl);
+
+ bug_unlock:
+	bpf_spin_unlock(lock);
+ bug:
+	bpf_printk("_block_alloc_more bug!");
+	hit_bug = 1;
+	return -2;
+}
+
+
+static inline int
 _block_alloc(struct cgn_user *u, struct cgn_v4_ipblock **out_ipbl,
 	     struct cgn_v4_block **out_bl)
 {
 	__u32 *frd_from, *frd_to;
 	__u32 idx, i;
-	int ret;
+	int ret = -1;
 
-	if (u->block_n >= CGN_USER_BLOCKS_MAX)
-		return -1;
+	if (__sync_fetch_and_add(&u->allocating, 1) >= 1) {
+		ret = 1;
+		goto exit;
+	}
 
+	/* too greedy */
+	if (u->block_n >= bl_user_max)
+		goto exit;
+
+	/* fetch from the same ipblock */
+	if (u->block_n > 0) {
+		*out_ipbl = bpf_map_lookup_elem(&v4_blocks, &u->ipblock_idx);
+		if (*out_ipbl == NULL)
+			goto bug;
+
+		ret = _block_alloc_more(u, *out_ipbl, out_bl);
+		goto exit;
+	}
+
+	/* first user block allocation, get the least used ipblock */
 	idx = 0;
 	frd_from = bpf_map_lookup_elem(&v4_free_blocks, &idx);
 	if (frd_from == NULL)
 		goto bug;
 
-	/* get the least used ipblock */
 	for (i = 0; i < bl_n; i++) {
 		idx = i + 1;
 		frd_to = bpf_map_lookup_elem(&v4_free_blocks, &idx);
 		if (frd_to == NULL)
 			goto bug;
 		if (frd_from[0] != frd_from[1]) {
-			ret = _block_alloc_sub(u, frd_from, frd_to, out_ipbl, out_bl);
+			ret = _block_alloc_first(u, frd_from, frd_to,
+						 out_ipbl, out_bl);
 			if (ret <= 0)
-				return ret;
+				goto exit;
 		}
 
 		frd_from = frd_to;
 	}
 
 	/* nothing left... */
-	return -1;
+	ret = -1;
+	goto exit;
 
  bug:
 	bpf_printk("_block_alloc bug!");
 	hit_bug = 1;
-	return -2;
+	ret = -2;
+
+ exit:
+	__sync_fetch_and_sub(&u->allocating, 1);
+	return ret;
 }
 
-static inline void
-_block_release(struct cgn_user *u, struct cgn_v4_ipblock *ipbl, struct cgn_v4_block *bl)
+
+static inline int
+_block_release(struct cgn_user *u, struct cgn_v4_ipblock *ipbl,
+	       struct cgn_v4_block *bl)
 {
-	__u32 i, idx, block_n;
+	__u32 idx, idx_to_move = ~0;
+	__u32 i, block_n;
 	__u32 *frd_from, *frd_to;
-	__u32 idx_to_move = ~0, ipbl_fr_idx;
+	__u32 ipbl_fr_idx, ipbl_old_fr_idx;
 	__u32 l_ipbl_n;
+	int ret;
+
+	if (__sync_fetch_and_add(&u->allocating, 1) >= 1) {
+		ret = 1;
+		goto exit;
+	}
+
+	/* take lock to update v4_free_block */
+	idx = 0;
+	struct bpf_spin_lock *lock = bpf_map_lookup_elem(&v4_block_lock, &idx);
+	if (lock == NULL)
+		goto bug;
 
 	idx = ipbl->used;
 	frd_from = bpf_map_lookup_elem(&v4_free_blocks, &idx);
@@ -271,21 +395,23 @@ _block_release(struct cgn_user *u, struct cgn_v4_ipblock *ipbl, struct cgn_v4_bl
 
 	l_ipbl_n = ipbl_n;
 
-	/* take lock to update v4_free_block */
-	idx = 0;
-	struct bpf_spin_lock *lock = bpf_map_lookup_elem(&v4_block_lock, &idx);
-	if (lock == NULL)
-		goto bug;
-
 	bpf_spin_lock(lock);
+
+	/* check for racy condition */
+	if (idx + 1 != ipbl->used) {
+		bpf_spin_unlock(lock);
+		ret = 1;
+		goto exit;
+	}
 
 	/* move us from v4_free_block[i] ... */
 	if (ipbl->fr_idx != frd_from[0]) {
 		if (frd_from[0] > l_ipbl_n || ipbl->fr_idx > l_ipbl_n)
 			goto bug_unlock;
 		idx_to_move = frd_from[frd_from[0] + 2];
-		ipbl_fr_idx = ipbl->fr_idx;
 		frd_from[ipbl->fr_idx + 2] = idx_to_move;
+		ipbl_fr_idx = ipbl->fr_idx;
+		ipbl_old_fr_idx = frd_from[0];
 	}
 	if (++frd_from[0] == l_ipbl_n + 1)
 		frd_from[0] = 0;
@@ -306,33 +432,52 @@ _block_release(struct cgn_user *u, struct cgn_v4_ipblock *ipbl, struct cgn_v4_bl
 		ipbl_to_move = bpf_map_lookup_elem(&v4_blocks, &idx_to_move);
 		if (ipbl_to_move == NULL)
 			goto bug;
-		if (ipbl_fr_idx == ipbl_to_move->fr_idx)
-			ipbl_to_move->fr_idx = ipbl->fr_idx;
+		bpf_spin_lock(lock);
+		if (ipbl_to_move->fr_idx != ipbl_old_fr_idx)
+			goto bug_unlock;
+		ipbl_to_move->fr_idx = ipbl_fr_idx;
+		bpf_spin_unlock(lock);
 	}
 
 	/* release in user's allocated block */
 	block_n = u->block_n;
-	if (block_n < 1 || block_n > CGN_USER_BLOCKS_MAX)
+	if (block_n < 1 || block_n > bl_user_max)
 		goto bug;
 	for (i = 0 ; i < block_n - 1; i++) {
-		if (u->block[i].ipbl_idx == ipbl->ipbl_idx &&
-		    u->block[i].bl_idx == bl->bl_idx)
+		if (u->ipblock_idx == ipbl->ipbl_idx &&
+		    u->block_idx[i] == bl->bl_idx)
 			break;
 	}
 	for ( ; i < block_n - 1; i++)
-		u->block[i] = u->block[i + 1];
+		u->block_idx[i] = u->block_idx[i + 1];
+
 	--u->block_n;
+	if (!u->block_n)
+		_cgn_user_release(u);
 
-	if (!u->block_n && !u->v6flow_n)
-		_user_v4_release(u);
-
-	return;
+	__sync_fetch_and_sub(&u->allocating, 1);
+	return 0;
 
  bug_unlock:
 	bpf_spin_unlock(lock);
  bug:
 	bpf_printk("_block_release bug");
 	hit_bug = 1;
+	ret = -2;
+ exit:
+	__sync_fetch_and_sub(&u->allocating, 1);
+	return ret;
+}
+
+static inline __u16
+_block_get_next_port(struct cgn_v4_block *bl)
+{
+	if (__sync_fetch_and_add(&bl->refcnt, 1) >= bl_flow_max) {
+		__sync_fetch_and_sub(&bl->refcnt, 1);
+		return 0;
+	}
+	__u16 port = __sync_fetch_and_add(&bl->cgn_port_next, 1);
+	return bl->cgn_port_start + (port % port_count);
 }
 
 
@@ -343,9 +488,17 @@ _block_release(struct cgn_user *u, struct cgn_v4_ipblock *ipbl, struct cgn_v4_bl
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, struct cgn_v4_flow_priv_hairpin_key);
+	__type(value, struct cgn_v4_flow_priv_hairpin);
+	__uint(max_entries, 3000000);
+} v4_priv_flows_hp SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, struct cgn_v4_flow_priv_key);
 	__type(value, struct cgn_v4_flow_priv);
-	__uint(max_entries, 1000000);
+	__uint(max_entries, 3000000);
 } v4_priv_flows SEC(".maps");
 
 struct {
@@ -353,7 +506,7 @@ struct {
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, struct cgn_v4_flow_pub_key);
 	__type(value, struct cgn_v4_flow_pub);
-	__uint(max_entries, 1000000);
+	__uint(max_entries, 3000000);
 } v4_pub_flows SEC(".maps");
 
 
@@ -375,18 +528,27 @@ _flow_release(struct cgn_v4_flow_priv_key *priv_k, struct cgn_v4_flow_priv *f)
 	if (idx >= bl_n)
 		goto bug;
 	bl = &ipbl->b[idx];
-	if (!--bl->refcnt) {
-		struct cgn_user_key u_k = {
-			.addr.ip4 = priv_k->priv_addr,
-			.flags = 0,
-		};
-		u = bpf_map_lookup_elem(&users, &u_k);
+	if (__sync_fetch_and_sub(&bl->refcnt, 1) == 1) {
+		u = bpf_map_lookup_elem(&users, &priv_k->priv_addr);
 		if (u == NULL)
 			goto bug;
-		_block_release(u, ipbl, bl);
+		if (_block_release(u, ipbl, bl) == 1) {
+			if (bpf_timer_start(&f->timer, 10000, 0)) {
+				bpf_printk("_flow_release: cannot restart "
+					   "timer in racy situation");
+			}
+			return;
+		}
 	}
 
 	bpf_map_delete_elem(&v4_priv_flows, priv_k);
+
+	struct cgn_v4_flow_priv_hairpin_key phk = {
+		.priv_addr = priv_k->priv_addr,
+		.priv_port = priv_k->priv_port,
+		.proto = priv_k->proto,
+	};
+	bpf_map_delete_elem(&v4_priv_flows_hp, &phk);
 
 	struct cgn_v4_flow_pub_key pub_k = {
 		.cgn_addr = f->cgn_addr,
@@ -400,7 +562,8 @@ _flow_release(struct cgn_v4_flow_priv_key *priv_k, struct cgn_v4_flow_priv *f)
 	return;
 
  bug:
-	bpf_printk("_flow_release bug, idx: %d", idx);
+	bpf_printk("_flow_release bug, ipbl:%p idx:%d/%d u:%p",
+		   ipbl, idx, bl_n, u);
 	hit_bug = 1;
 }
 
@@ -413,70 +576,19 @@ _flow_timer_cb(void *_map, struct cgn_v4_flow_priv_key *key,
 	return 0;
 }
 
-/* get next cgn port */
-static inline __u16
-_block_get_next_port(struct cgn_v4_block *bl)
+static int
+_flow_add_entry(const struct cgn_packet *pp, struct cgn_v4_block *bl,
+		__u16 cgn_port, struct cgn_v4_flow_priv **out_f)
 {
-	if (__sync_fetch_and_add(&bl->refcnt, 1) >= bl_flow_max) {
-		__sync_fetch_and_sub(&bl->refcnt, 1);
-		return 0;
-	}
-	__u16 port = __sync_fetch_and_add(&bl->cgn_port_next, 1);
-	return bl->cgn_port_start + (port % port_count);
-}
+	int ret = -1;
 
-static inline struct cgn_v4_flow_priv *
-_flow_alloc(struct cgn_user *u, const struct cgn_packet *pp)
-{
-	struct cgn_v4_ipblock *ipbl;
-	struct cgn_v4_block *bl;
-	__u8 block_n = u->block_n;
-	__u16 cgn_port = 0;
-	int ret, i;
-
-	if (block_n > 0) {
-		if (block_n >= CGN_USER_BLOCKS_MAX)
-			block_n = CGN_USER_BLOCKS_MAX;
-		/* XXX check hairpin */
-
-		/* try with lastest block used to allocate block first */
-		if (_block_lookup(u->block[block_n - 1], &ipbl, &bl) < 0)
-			return NULL;
-		cgn_port = _block_get_next_port(bl);
-
-		/* if no space left, check in other allocated blocks */
-		for (i = 0; !cgn_port && i < block_n - 1; i++) {
-			if (_block_lookup(u->block[i], &ipbl, &bl) < 0)
-				return NULL;
-			cgn_port = _block_get_next_port(bl);
-			if (cgn_port) {
-				/* got port. move this block to the last
-				 * place, so next alloc will use it first */
-				for ( ; i < block_n - 1; i++) {
-					struct cgn_user_allocated_blocks tmp;
-					tmp = u->block[i];
-					u->block[i] = u->block[i + 1];
-					u->block[i + 1] = tmp;
-				}
-			}
-		}
-	}
-
-	/* last resort, allocate a new block */
-	if (!cgn_port) {
-		if (_block_alloc(u, &ipbl, &bl) < 0)
-			return NULL;
-		cgn_port = _block_get_next_port(bl);
-		if (!cgn_port)
-			return NULL;
-	}
 	/* bpf_printk("%d: user 0x%x get port: %d newrefc: %d ", */
 	/* 	   bpf_get_smp_processor_id(), bpf_ntohl(u->addr.ip4), */
 	/* 	   cgn_port, bl->refcnt); */
 
 	/* add pub entry */
 	struct cgn_v4_flow_pub_key pub_k = {
-		.cgn_addr = ipbl->cgn_addr,
+		.cgn_addr = pp->cgn_addr,
 		.pub_addr = pp->dst_addr,
 		.cgn_port = cgn_port,
 		.pub_port = pp->dst_port,
@@ -484,14 +596,21 @@ _flow_alloc(struct cgn_user *u, const struct cgn_packet *pp)
 	};
 	struct cgn_v4_flow_pub pf = {
 		.priv_addr = pp->src_addr,
-		.cgn_addr = ipbl->cgn_addr,
+		.cgn_addr = pp->cgn_addr,
 		.priv_port = pp->src_port,
 		.cgn_port = cgn_port,
 	};
 	ret = bpf_map_update_elem(&v4_pub_flows, &pub_k, &pf, BPF_NOEXIST);
-	if (ret) {
+	if (ret == -EEXIST) {
+		/* may happen if cgn_port is already used with the
+		 * same ip_pub:port_pub target. try with one cgn_port in each
+		 * block (do not try with every cgn_port) */
+		ret = 1;
+		goto exit;
+
+	} else if (ret) {
 		bpf_printk("cannot insert in v4_pub_flows: %d", ret);
-		return NULL;
+		goto exit;
 	}
 
 	/* add priv entry */
@@ -503,40 +622,151 @@ _flow_alloc(struct cgn_user *u, const struct cgn_packet *pp)
 		.proto = pp->proto,
 	};
 	struct cgn_v4_flow_priv ppf = {
-		.created = bpf_ktime_get_ns(),
-		.cgn_addr = ipbl->cgn_addr,
+		.cgn_addr = pp->cgn_addr,
 		.cgn_port = cgn_port,
 		.bl_idx = bl->bl_idx,
-		.ipbl_idx = ipbl->ipbl_idx,
+		.ipbl_idx = bl->ipbl_idx,
 	};
 	ret = bpf_map_update_elem(&v4_priv_flows, &priv_k, &ppf, BPF_NOEXIST);
 	if (ret) {
+		/* this one should not happen */
 		bpf_printk("cannot insert in v4_priv_flows: %d", ret);
+		goto err_priv;
 	}
+
+	/* add priv hairpin entry. if it exists, update it */
+	struct cgn_v4_flow_priv_hairpin_key phk = {
+		.priv_addr = priv_k->priv_addr,
+		.priv_port = priv_k->priv_port,
+		.proto = priv_k->proto,
+	};
+	struct cgn_v4_flow_priv_hairpin ph = {
+		.cgn_port = cgn_port,
+	};
+	bpf_map_update_elem(&v4_priv_flows_hp, &phk, &ph, 0);
 
 	/* need to retrieve it from map to initialize bpf timer */
 	struct cgn_v4_flow_priv *f = bpf_map_lookup_elem(&v4_priv_flows, &priv_k);
 	if (f == NULL) {
-		bpf_printk("bug: unable to retrieve just inserted v4_priv_flows");
+		bpf_printk("flow_add_entry: unable to retrieve just "
+			   "inserted v4_priv_flows");
 		goto err;
 	}
 
 	ret = bpf_timer_init(&f->timer, &v4_priv_flows, CLOCK_MONOTONIC);
 	if (ret) {
-		bpf_printk("bug: cannot init timer: %d", ret);
+		bpf_printk("flow_add_entry: cannot init timer: %d", ret);
 		goto err;
 	}
 	ret = bpf_timer_set_callback(&f->timer, _flow_timer_cb);
-	if (ret)
+	if (ret) {
+		bpf_printk("flow_add_entry: cannot set timer cb: %d", ret);
 		goto err;
+	}
 
-	return f;
+	*out_f = f;
+	return 0;
 
  err:
-	bpf_printk("error setting up flow");
 	bpf_map_delete_elem(&v4_priv_flows, &priv_k);
+ err_priv:
 	bpf_map_delete_elem(&v4_pub_flows, &pub_k);
+ exit:
+	__sync_fetch_and_sub(&bl->refcnt, 1);
+	return ret;
+}
+
+static inline struct cgn_v4_flow_priv *
+_flow_alloc(struct cgn_user *u, struct cgn_packet *pp)
+{
+	struct cgn_v4_ipblock *ipbl;
+	struct cgn_v4_block *bl;
+	struct cgn_v4_flow_priv *f = NULL;
+	__u8 block_n = u->block_n;
+	__u16 cgn_port;
+	int i;
+
+	if (block_n > 0) {
+		if (block_n >= bl_user_max)
+			block_n = bl_user_max;
+
+		/* first, try with lastest block we allocated from */
+		if (_block_lookup(u->ipblock_idx, u->block_idx[block_n - 1],
+				  &ipbl, &bl) < 0)
+			return NULL;
+		pp->cgn_addr = ipbl->cgn_addr;
+		cgn_port = _block_get_next_port(bl);
+		if (cgn_port && _flow_add_entry(pp, bl, cgn_port, &f) <= 0)
+			return f;
+
+		/* if no space left, check in other allocated blocks */
+		for (i = 0; i < block_n - 1; i++) {
+			if (_block_lookup(u->ipblock_idx, u->block_idx[i],
+					  &ipbl, &bl) < 0)
+				return NULL;
+			cgn_port = _block_get_next_port(bl);
+			if (cgn_port &&
+			    _flow_add_entry(pp, bl, cgn_port, &f) <= 0) {
+				/* got port. move this block to the last
+				 * place, so next alloc will use it first */
+				for ( ; f != NULL && i < block_n - 1; i++) {
+					__u16 tmp = u->block_idx[i];
+					u->block_idx[i] = u->block_idx[i + 1];
+					u->block_idx[i + 1] = tmp;
+				}
+				return f;
+			}
+		}
+	}
+
+	/* last chance, allocate a new block */
+	int ret = _block_alloc(u, &ipbl, &bl);
+	if (ret < 0) {
+		bpf_printk("cannot alloc block");
+		return NULL;
+	}
+	if (ret > 0) {
+		bpf_printk("racy block alloc");
+		pp->racy = 1;
+		return NULL;
+	}
+	pp->cgn_addr = ipbl->cgn_addr;
+	cgn_port = _block_get_next_port(bl);
+	if (cgn_port)
+		_flow_add_entry(pp, bl, cgn_port, &f);
+
+	return f;
+}
+
+static inline struct cgn_v4_flow_priv *
+_flow_alloc_with_cgn_port(struct cgn_user *u, struct cgn_packet *pp, __u16 cgn_port)
+{
+	struct cgn_v4_ipblock *ipbl;
+	struct cgn_v4_block *bl;
+	struct cgn_v4_flow_priv *f = NULL;
+	__u8 block_n = u->block_n;
+	int i;
+
+	if (block_n >= bl_user_max)
+		block_n = bl_user_max;
+	for (i = block_n - 1; i >= 0; i--) {
+		if (_block_lookup(u->ipblock_idx, u->block_idx[i],
+				  &ipbl, &bl) < 0)
+			return NULL;
+		if (cgn_port >= bl->cgn_port_start &&
+		    cgn_port < bl->cgn_port_start + port_count) {
+			if (__sync_fetch_and_add(&bl->refcnt, 1) >= bl_flow_max) {
+				__sync_fetch_and_sub(&bl->refcnt, 1);
+				return 0;
+			}
+			pp->cgn_addr = ipbl->cgn_addr;
+			_flow_add_entry(pp, bl, cgn_port, &f);
+			return f;
+		}
+	}
+
 	return NULL;
+
 }
 
 
@@ -568,6 +798,17 @@ _flow_v4_lookup_priv(const struct cgn_packet *pp)
 	return bpf_map_lookup_elem(&v4_priv_flows, &priv_k);
 }
 
+static struct cgn_v4_flow_priv_hairpin *
+_flow_v4_lookup_priv_hairpin(const struct cgn_packet *pp)
+{
+	struct cgn_v4_flow_priv_key priv_k = {
+		.priv_addr = pp->src_addr,
+		.priv_port = pp->src_port,
+		.proto = pp->proto,
+	};
+
+	return bpf_map_lookup_elem(&v4_priv_flows_hp, &priv_k);
+}
 
 
 /*
@@ -576,6 +817,7 @@ _flow_v4_lookup_priv(const struct cgn_packet *pp)
  *
  * return:
  *    0: ok
+ *    1: internal
  *   10: no associated flow
  *   11: user alloc error
  *   12: flow alloc error
@@ -583,24 +825,37 @@ _flow_v4_lookup_priv(const struct cgn_packet *pp)
 static inline __attribute__((always_inline)) int
 cgn_flow_handle_priv(struct cgn_packet *cp)
 {
-	struct cgn_user *u;
+	struct cgn_v4_flow_priv_hairpin *hf;
 	struct cgn_v4_flow_priv *f;
+	struct cgn_user *u;
 	int ret;
-
-	u = _user_v4_lookup(cp->src_addr);
-	if (u == NULL) {
-		if (cp->icmp_err != NULL)
-			return 10;
-		u = _user_v4_alloc(cp->src_addr);
-		if (u == NULL)
-			return 11;
-	}
 
 	f = _flow_v4_lookup_priv(cp);
 	if (f == NULL) {
 		if (cp->icmp_err != NULL)
 			return 10;
-		f = _flow_alloc(u, cp);
+
+		/* get/allocate user before allocating flow */
+		u = _cgn_user_lookup(cp->src_addr);
+		if (u == NULL) {
+			if (cp->icmp_err != NULL)
+				return 10;
+			u = _cgn_user_alloc(cp->src_addr);
+			if (u == NULL)
+				return 11;
+		}
+
+		/* check if the same {priv_addr:priv_port:proto} was already used
+		 * by our user. allow STUN. this feature is called 'hairpin' here */
+		hf = _flow_v4_lookup_priv_hairpin(cp);
+		if (hf != NULL) {
+			f = _flow_alloc_with_cgn_port(u, cp, hf->cgn_port);
+			if (f == NULL)
+				f = _flow_alloc(u, cp);
+			f = NULL;
+		} else {
+			f = _flow_alloc(u, cp);
+		}
 		if (f == NULL)
 			return 12;
 
@@ -620,25 +875,29 @@ cgn_flow_handle_priv(struct cgn_packet *cp)
 			}
 		}
 	}
-	/* XXX may apply policy or sorts of things on user */
 
 	cp->src_addr = f->cgn_addr;
 	cp->src_port = f->cgn_port;
 
-	/* start or refresh flow timeout */
-	__u64 to = flow_timeout_ns(cp->proto, cp->dst_port, f->proto_state);
-	ret = bpf_timer_start(&f->timer, to, 0);
-	if (ret) {
-		bpf_printk("cannot (re)start timer??? (val=%ld)", to);
-		struct cgn_v4_flow_priv_key priv_k = {
-			.priv_addr = cp->src_addr,
-			.pub_addr = cp->dst_addr,
-			.priv_port = cp->src_port,
-			.pub_port = cp->dst_port,
-			.proto = cp->proto,
-		};
-		_flow_release(&priv_k, f);
-		return 12;
+	/* start or refresh flow timeout, every ~1 second */
+	__u64 now = bpf_ktime_get_ns();
+	if ((f->updated >> 30ULL) != (now >> 30ULL)) {
+		__u64 to = flow_timeout_ns(cp->proto, cp->dst_port, f->proto_state);
+		ret = bpf_timer_start(&f->timer, to, 0);
+
+		if (ret) {
+			bpf_printk("cannot (re)start timer??? (val=%ld)", to);
+			struct cgn_v4_flow_priv_key priv_k = {
+				.priv_addr = cp->src_addr,
+				.pub_addr = cp->dst_addr,
+				.priv_port = cp->src_port,
+				.pub_port = cp->dst_port,
+				.proto = cp->proto,
+			};
+			_flow_release(&priv_k, f);
+			return 1;
+		}
+		f->updated = now;
 	}
 
 	return 0;
@@ -656,7 +915,6 @@ cgn_flow_handle_priv(struct cgn_packet *cp)
 static inline __attribute__((always_inline)) int
 cgn_flow_handle_pub(struct cgn_packet *cp)
 {
-	struct cgn_user *u;
 	struct cgn_v4_flow_pub *f;
 
 	f = _flow_v4_lookup_pub(cp);
@@ -678,13 +936,6 @@ cgn_flow_handle_pub(struct cgn_packet *cp)
 				priv_f->proto_state = f->proto_state;
 		}
 	}
-
-	u = _user_v4_lookup(f->priv_addr);
-	if (f == NULL) {
-		/* is a bug */
-		return 10;
-	}
-	/* XXX may apply policy or sorts of things on user */
 
 	cp->dst_addr = f->priv_addr;
 	cp->dst_port = f->priv_port;
@@ -840,7 +1091,7 @@ _handle_pkt_icmp_error(struct xdp_md *ctx, struct iphdr *outer_ip4h,
 	int ret;
 
 	if ((void *)(ip4h + 1) > data_end || ip4h->version != 4)
-		return 1;
+		return 2;
 
 	/* parse packet with swapped src/dst, in order to be able
 	 * to lookup flow */
@@ -854,7 +1105,7 @@ _handle_pkt_icmp_error(struct xdp_md *ctx, struct iphdr *outer_ip4h,
 
 	udp = (void *)(ip4h) + ip4h->ihl * 4;
 	if ((void *)(udp + 1) > data_end)
-		return 1;
+		return 2;
 
 	switch (ip4h->protocol) {
 	case IPPROTO_UDP:
@@ -874,11 +1125,11 @@ _handle_pkt_icmp_error(struct xdp_md *ctx, struct iphdr *outer_ip4h,
 			cp.src_port = bpf_ntohs(icmp->un.echo.id);
 			break;
 		default:
-			return 2;
+			return 3;
 		}
 		break;
 	default:
-		return 2;
+		return 3;
 	}
 
 	/* lookup and process flow, then rewrite inner l3/l4 and outer l3 */
@@ -922,8 +1173,9 @@ _handle_pkt_icmp_error(struct xdp_md *ctx, struct iphdr *outer_ip4h,
  *
  * returns:
  *    0: ok. packet modified
- *    1: invalid packet
- *    2: unsupported protocol/operation
+ *    1: internal
+ *    2: invalid packet
+ *    3: unsupported protocol/operation
  *   10: no associated flow
  *   11: user alloc error
  *   12: flow alloc error
@@ -954,14 +1206,14 @@ cgn_pkt_handle(struct xdp_md *ctx, struct iphdr *ip4h, __u8 from_priv)
 	case IPPROTO_UDP:
 		udp = payload;
 		if ((void *)(udp + 1) > data_end)
-			return 1;
+			return 2;
 		cp.src_port = bpf_ntohs(udp->source);
 		cp.dst_port = bpf_ntohs(udp->dest);
 		break;
 	case IPPROTO_TCP:
 		tcp = payload;
 		if ((void *)(tcp + 1) > data_end)
-			return 1;
+			return 2;
 		cp.src_port = bpf_ntohs(tcp->source);
 		cp.dst_port = bpf_ntohs(tcp->dest);
 		cp.tcp_flags = ((union tcp_word_hdr *)(tcp))->words[3];
@@ -969,7 +1221,7 @@ cgn_pkt_handle(struct xdp_md *ctx, struct iphdr *ip4h, __u8 from_priv)
 	case IPPROTO_ICMP:
 		icmp = payload;
 		if ((void *)(icmp + 1) > data_end)
-			return 1;
+			return 2;
 		switch (icmp->type) {
 		case ICMP_ECHO:
 			cp.src_port = bpf_ntohs(icmp->un.echo.id);
@@ -985,11 +1237,11 @@ cgn_pkt_handle(struct xdp_md *ctx, struct iphdr *ip4h, __u8 from_priv)
 						      (struct iphdr *)(icmp + 1),
 						      from_priv);
 		default:
-			return 2;
+			return 3;
 		}
 		break;
 	default:
-		return 2;
+		return 3;
 	}
 
 	if (from_priv) {

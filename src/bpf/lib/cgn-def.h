@@ -12,17 +12,18 @@ struct cgn_v4_block {
 	__u64			refcnt;		/* used flow */
 	__u64			cgn_port_next;
 	__u32			ipbl_idx;	/* idx in map 'blocks' */
-	__u16			bl_idx;		/* ipbl->b[@idx] */
-	__u16			cgn_port_start;	/* fixed */
+	__u32			bl_idx;		/* ipbl->b[@idx] */
+	__u32			cgn_port_start;	/* fixed */
+	__u32			_pad;
 };
 
 struct cgn_v4_ipblock {
+	__u32			cgn_addr;	/* cpu order */
 	__u32			ipbl_idx;
 	__u32			fr_idx;		/* idx in map 'v4_free_blocks'  */
-	__u32			cgn_addr;	/* cpu order */
-	__u32			used;
-	__u32			total;
+	__u32			used;		/* [ 0 - bl_n ] */
 	__u32			next;
+	__u32			_pad;
 	struct cgn_v4_block	b[];		/* 'total' blocks follow */
 };
 
@@ -64,11 +65,11 @@ struct cgn_v4_flow_priv_key {
 
 struct cgn_v4_flow_priv {
 	struct bpf_timer	timer;		/* flow expiration */
-	__u64			created;
+	__u64			updated;
 	__u32			cgn_addr;
 	__u16			cgn_port;
 	__u16			bl_idx;
-	__u32			ipbl_idx;
+	__u16			ipbl_idx;
 	__u8			proto_state;	/* tcp state */
 };
 
@@ -86,32 +87,25 @@ struct cgn_v4_flow_priv_hairpin {
 
 
 /*
- * user, on priv side. ipv4 or ipv6.
+ * cgn user, keep allocated blocks
  */
-#define CGN_USER_IS_V6		0x01
+
+#define CGN_USER_BLOCKS_MAX	8
 
 struct cgn_user_key {
-	union v4v6addr		addr;
-	__u8			flags;
+	__u32			addr;
 } __attribute__((packed));
-
-
-struct cgn_user_allocated_blocks {
-	__u32			ipbl_idx;
-	__u32			bl_idx;
-} __attribute__((packed));
-
-#define CGN_USER_BLOCKS_MAX	4
 
 struct cgn_user {
-	union v4v6addr		addr;
-	struct cgn_user_allocated_blocks block[CGN_USER_BLOCKS_MAX];
+	__u64			created;
+	__u64			allocating;
+	__u32			addr;
+	__u32			ipblock_idx;
+	__u32			block_idx[CGN_USER_BLOCKS_MAX];
 	__u8			block_n;
-	__u8			block_cur;
-	__u16			v6flow_n;
-	__u8			flags;
 	__u8			_pad[3];
-} __attribute__((packed));
+};
+
 
 
 /* all address/port in cpu order */
@@ -119,11 +113,13 @@ struct cgn_packet
 {
 	__u32		src_addr;
 	__u32		dst_addr;
+	__u32		cgn_addr;
 	__u16		src_port;
 	__u16		dst_port;
 	__u8		proto;
 	__u8		from_priv;
-	__u8		_pad[2];
+	__u8		racy;
+	__u8		_pad;
 	void		*data_end;
 	struct icmphdr	*icmp_err;
 	__u32		tcp_flags;

@@ -35,7 +35,7 @@ struct cgn_ctx
 struct init_var_set
 {
 	const char *name;
-	uint8_t type;		/* 1:u32, 2:u64 */
+	uint8_t type;		/* 0:u8, 1:u16, 2:u32, 3:u64 */
 	const void *value;
 };
 
@@ -93,12 +93,22 @@ _set_const_var(struct bpf_object *obj, const struct init_var_set *consts)
 			if (strcmp(name, consts[j].name))
 				continue;
 			switch (consts[j].type) {
+			case 0:
+				*((uint8_t *)(rodata + secinfo[i].offset)) =
+					*(uint8_t *)consts[j].value;
+				++set;
+				break;
 			case 1:
+				*((uint16_t *)(rodata + secinfo[i].offset)) =
+					*(uint16_t *)consts[j].value;
+				++set;
+				break;
+			case 2:
 				*((uint32_t *)(rodata + secinfo[i].offset)) =
 					*(uint32_t *)consts[j].value;
 				++set;
 				break;
-			case 2:
+			case 3:
 				*((uint64_t *)(rodata + secinfo[i].offset)) =
 					*(uint64_t *)consts[j].value;
 				++set;
@@ -141,15 +151,19 @@ cgn_ctx_create(const struct cgn_cfg *bc, struct bpf_object *obj)
 		ctx->ipblock_n += 1 << (32 - bc->addr[i].netmask);
 	}
 
-	printf("set const var ipbl_n: %d bl_n: %d bl_size: %d flow_max: %d\n",
-	       ctx->ipblock_n, ctx->block_count, bc->block_size, bc->flow_max);
-	icmp_to = bc->timeout_icmp * 1000000000ULL;
+	icmp_to = bc->timeout_icmp * NSEC_PER_SEC;
+	uint32_t bl_flow_max = bc->flow_per_user / bc->block_per_user;
+	printf("set const var ipbl_n: %d bl_n: %d bl_size: %d "
+	       "block_per_user:%d flow_per_user: %d=>%d\n",
+	       ctx->ipblock_n, ctx->block_count, bc->block_size,
+	       bc->block_per_user, bc->flow_per_user, bl_flow_max);
 	struct init_var_set consts_var[] = {
-		{ .name = "ipbl_n", .type = 1, .value = &ctx->ipblock_n },
-		{ .name = "bl_n", .type = 1, .value = &ctx->block_count },
-		{ .name = "port_count", .type = 1, .value = &bc->block_size },
-		{ .name = "bl_flow_max", .type = 1, .value = &bc->flow_max },
-		{ .name = "icmp_timeout", .type = 2, .value = &icmp_to },
+		{ .name = "ipbl_n", .type = 2, .value = &ctx->ipblock_n },
+		{ .name = "bl_n", .type = 2, .value = &ctx->block_count },
+		{ .name = "bl_user_max", .type = 0, .value = &bc->block_per_user },
+		{ .name = "bl_flow_max", .type = 2, .value = &bl_flow_max },
+		{ .name = "port_count", .type = 2, .value = &bc->block_size },
+		{ .name = "icmp_timeout", .type = 3, .value = &icmp_to },
 		{ NULL },
 	};
 	_set_const_var(obj, consts_var);
@@ -224,7 +238,6 @@ cgn_ctx_load(const struct cgn_ctx *ctx)
 			ipbl->ipbl_idx = k;
 			ipbl->fr_idx = k;
 			ipbl->cgn_addr = ip_addr;
-			ipbl->total = ctx->block_count;
 			for (l = 0; l < ctx->block_count; l++) {
 				ipbl->b[l].ipbl_idx = k;
 				ipbl->b[l].bl_idx = l;
@@ -293,13 +306,13 @@ cgn_ctx_dump(const struct cgn_ctx *ctx, int /* full */)
 		bpf_map__lookup_elem(ctx->block_map, &i, sizeof (i),
 				     data, bmsize, 0);
 		ipbl = (struct cgn_v4_ipblock *)(data);
-		if (!ipbl->used && ipbl->total > 4)
+		if (!ipbl->used)
 			continue;
 
 		uint32_t ip = htonl(ipbl->cgn_addr);
 		printf("  %s: alloc %d/%d next %d\n",
 		       inet_ntop(AF_INET, &ip, buf, 128),
-		       ipbl->used, ipbl->total, ipbl->next);
+		       ipbl->used, ctx->block_count, ipbl->next);
 	}
 
 	printf("free indexes:\n");
@@ -329,10 +342,10 @@ cgn_ctx_dump(const struct cgn_ctx *ctx, int /* full */)
 			printf("lookup err: %d\n", ret);
 			break;
 		}
-		uint32_t addr = ntohl(u.addr.ip4);
+		uint32_t addr = ntohl(u.addr);
 		printf("  %s: blocks: %d/%d\n",
 		       inet_ntop(AF_INET, &addr, buf, sizeof (buf)),
-		       u.block_cur, u.block_n);
+		       u.block_n, CGN_USER_BLOCKS_MAX);
 	}
 }
 
@@ -350,14 +363,19 @@ static void
 _test1(int fd, struct bpf_test_run_opts *rcfg)
 {
 	struct cgn_packet *pp = (struct cgn_packet *)rcfg->data_in;
+	struct cgn_packet *rpp = (struct cgn_packet *)rcfg->data_out;
 	int i, k;
+
+	cgn_ctx_dump(test_bctx, 0);
 
 	/* 4 users */
 	for (k = 0; k < 4; k++) {
 		/* alloc 4 * 20 = 80 ports */
 		for (i = 0; i < 80; i++) {
+			if (i % 20 == 1)
+				cgn_ctx_dump(test_bctx, 0);
 			pp->src_port++;
-			printf("alloc at user[%d]=0x%x port[%d]=%d\n",
+			printf("alloc at user[%d]=0x%x src_port[%d]=%d\n",
 			       k, pp->src_addr, i, pp->src_port);
 			assert(!bpf_prog_test_run_opts(fd, rcfg));
 			if (rcfg->retval) {
@@ -365,19 +383,24 @@ _test1(int fd, struct bpf_test_run_opts *rcfg)
 				       rcfg->retval, k, i);
 				abort();
 			}
-			printf("allocated port = %d\n", pp->src_port);
+			printf("cgn_port = %d\n", rpp->src_port);
 		}
 
 		/* cannot alloc more flow */
 		pp->src_port++;
 		assert(!bpf_prog_test_run_opts(fd, rcfg));
 		assert(rcfg->retval == 12);
+		printf("cannot alloc more is ok\n");
+
+		cgn_ctx_dump(test_bctx, 0);
 
 		pp->src_addr++;
 		pp->src_port = 32000;
 	}
 
 	/* no more block for 5th user */
+	assert(!bpf_prog_test_run_opts(fd, rcfg));
+	assert(rcfg->retval == 12);
 	assert(!bpf_prog_test_run_opts(fd, rcfg));
 	assert(rcfg->retval == 12);
 }
@@ -427,37 +450,50 @@ _test3(void *varg)
 		    .ctx_in = &ctx_in,
 		    .ctx_size_in = sizeof (ctx_in),
 		    .repeat = 1);
-	int i, k;
+	int max_user = 200;
+	time_t test_duration = 30;
+	time_t start = time(NULL);
+	int i, k = 0;
 
 	printf("start test3: %d\n", arg->id);
 
-	pp.src_addr = 0x0100000a;
 	pp.dst_addr = 0x04040408;
-	pp.src_port = 13555;
 	pp.dst_port = 80;
 	pp.from_priv = 1;
 	pp.proto = IPPROTO_TCP;
 	pp.src_port = 10000 + arg->id * 1000;
 
-	/* alloc for 20k users */
-	for (k = 0; k < 2000; k++) {
-		if (k % 500 == 0)
-			printf("%d: done %d users\n", arg->id, k);
-		/* alloc 20 ports each */
-		for (i = 0; i < 20; i++) {
+	while (start + test_duration > time(NULL)) {
+		pp.src_addr = 0x0a000001 + (random() % max_user);
+		pp.src_port = 10000 + arg->id * 1000 + (random() % 100) * 10;
+
+		for (i = 0; i < 10; i++) {
 			pp.src_port++;
 			assert(!bpf_prog_test_run_opts(arg->fd, &rcfg));
-			if (rcfg.retval != 0) {
-				printf("fails at user %d port %d\n", k, i);
+			if (rcfg.retval == 12 && pp.racy) {
+				printf("racy flow insert iter %d port %d\n", k, i);
+			} else if (rcfg.retval != 0) {
+				printf("[%d] fail=%d at iter %d port %d\n",
+				       arg->id, rcfg.retval, k, i);
+				if (arg->id == 0)
+					cgn_ctx_dump(test_bctx, 0);
 				return NULL;
 			}
 		}
 
-		pp.src_addr++;
-		pp.src_port = 10000 + arg->id * 1000;
+		if (++k % 500 == 0) {
+			printf("%d: done %d iters\n", arg->id, k);
+			/* if (arg->id == 0) */
+			/* 	cgn_ctx_dump(test_bctx, 0); */
+		}
 	}
 
-	printf("done test3: %d\n", arg->id);
+	/* wait for flows timeout */
+	if (arg->id == 0) {
+		sleep(8);
+		/* XXX: assert no block is allocated */
+		cgn_ctx_dump(test_bctx, 0);
+	}
 
 	return NULL;
 }
@@ -470,10 +506,11 @@ cgn_test_init(int test, struct bpf_object *obj)
 		.port_start = 1000,
 		.port_end = 65535,
 		.block_size = 1000,
-		.flow_max = 2000,
+		.flow_per_user = 2000,
+		.block_per_user = 4,
 		.timeout_icmp = 120,
 		.timeout.udp = 120,
-		.timeout.tcp_synfin = 20,
+		.timeout.tcp_synfin = 5,
 		.timeout.tcp_est = 600,
 	};
 
@@ -482,7 +519,7 @@ cgn_test_init(int test, struct bpf_object *obj)
 		cfg.port_start = 30000;
 		cfg.port_end = 30320;
 		cfg.block_size = 20;
-		cfg.flow_max = 20;
+		cfg.flow_per_user = 100;
 		addr_parse_ip("37.127.0.1/32", &cfg.addr[0].a,
 			      &cfg.addr[0].netmask, NULL, 1);
 		break;
@@ -493,6 +530,8 @@ cgn_test_init(int test, struct bpf_object *obj)
 		break;
 
 	case 3:
+		cfg.flow_per_user = libbpf_num_possible_cpus() * 1000 / 2;
+		cfg.block_per_user = 8;
 	case 10:
 		addr_parse_ip("37.141.0.0/24", &cfg.addr[0].a,
 			      &cfg.addr[0].netmask, NULL, 1);
@@ -523,7 +562,7 @@ cgn_test_start(int test, struct bpf_object *obj)
 
 	switch (test) {
 	case 1 ... 3:
-		prgname = "xdp_test_alloc";
+		prgname = "xdp_test_flow_alloc";
 		break;
 	case 10:
 		prgname = "xdp_entry";
@@ -542,7 +581,7 @@ cgn_test_start(int test, struct bpf_object *obj)
 
 	pp->src_addr = 0x0100000a;
 	pp->dst_addr = 0x08080808;
-	pp->src_port = 13555;
+	pp->src_port = 14000;
 	pp->dst_port = 80;
 	pp->from_priv = 1;
 	pp->proto = IPPROTO_TCP;
@@ -582,7 +621,7 @@ cgn_test_start(int test, struct bpf_object *obj)
 			pthread_setaffinity_np(pth[i], sizeof(cpu_set_t), &cpuset);
 		}
 
-		for (i = 0; i < cpu_n; i++)
+		for (i = cpu_n - 1; i >= 0; i--)
 			pthread_join(pth[i], NULL);
 		break;
 

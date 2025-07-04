@@ -8,7 +8,6 @@
 
 #include "flow-def.h"
 
-#define NSEC_PER_SEC		10000000000ULL
 
 /*
  * flow timeout by port and protocol
@@ -25,7 +24,7 @@ struct {
 } flow_port_timeouts SEC(".maps");
 
 /* icmp config */
-const volatile __u64 icmp_timeout = 120 * NSEC_PER_SEC;
+const volatile __u64 icmp_timeout = FLOW_DEFAULT_TIMEOUT;
 
 
 static inline __u64
@@ -37,7 +36,7 @@ flow_udp_timeout_ns(__u16 port)
 	v = bpf_map_lookup_elem(&flow_port_timeouts, &k);
 	if (v != NULL)
 		return v->udp * NSEC_PER_SEC;
-	return 120 * NSEC_PER_SEC;
+	return FLOW_DEFAULT_TIMEOUT;
 }
 
 static inline __u64
@@ -52,7 +51,7 @@ flow_tcp_timeout_ns(__u16 port, __u8 state)
 			return v->tcp_est * NSEC_PER_SEC;
 		return v->tcp_synfin * NSEC_PER_SEC;
 	}
-	return 120 * NSEC_PER_SEC;
+	return FLOW_DEFAULT_TIMEOUT;
 }
 
 static inline __u64
