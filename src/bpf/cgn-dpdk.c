@@ -64,6 +64,11 @@ int xdp_dpdk_prosthesis(struct xdp_md *ctx)
 	if (ip4h->version != 4)
 		return XDP_PASS;
 
+#if 1
+	/* ip admin */
+	if (ip4h->daddr == __constant_htonl(0x01020304))
+		return XDP_PASS;
+#endif
 	payload = (void *)ip4h + ip4h->ihl * 4;
 
 	/* inspect l4 layer */
@@ -91,7 +96,7 @@ int xdp_dpdk_prosthesis(struct xdp_md *ctx)
 		switch (icmp->type) {
 		case ICMP_ECHO:
 		case ICMP_ECHOREPLY:
-			return XDP_PASS; // XXX should pass to dpdk
+			break;
 		case ICMP_DEST_UNREACH:
 		case ICMP_TIME_EXCEEDED:
 			break;
