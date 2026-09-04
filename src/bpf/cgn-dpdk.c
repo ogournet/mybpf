@@ -19,6 +19,13 @@ struct {
 	__uint(max_entries, 64);
 } xsks_map SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, __u32);   // target IPv4 addr, network byte order
+	__uint(max_entries, 1);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} admin_ip SEC(".maps");
 
 /*
  * filter only part of trafic for dpdk-app
@@ -36,6 +43,8 @@ int xdp_dpdk_prosthesis(struct xdp_md *ctx)
 	struct icmphdr *icmp;
 	void *payload;
 	__u16 eth_type, vlan = 0;
+	__u32 key = 0;
+	__u32 *daddr;
 	int ret;
 
 	if ((void *)(ethh + 1) > data_end)
@@ -64,11 +73,10 @@ int xdp_dpdk_prosthesis(struct xdp_md *ctx)
 	if (ip4h->version != 4)
 		return XDP_PASS;
 
-#if 1
-	/* ip admin */
-	if (ip4h->daddr == __constant_htonl(0x01020304))
+	daddr = bpf_map_lookup_elem(&admin_ip, &key);
+	if (daddr != NULL && ip4h->daddr == *daddr)
 		return XDP_PASS;
-#endif
+
 	payload = (void *)ip4h + ip4h->ihl * 4;
 
 	/* inspect l4 layer */
